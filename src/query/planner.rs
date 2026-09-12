@@ -1,4 +1,4 @@
-//! Query planning (docs/history/refactor-plan.md P2): the single source of truth for what
+//! Query planning: the single source of truth for what
 //! to ask the bridge (`fetch`) and what to do client-side (`post`).
 //!
 //! The "filtered/sorted/counted/paginated ⇒ fetch the full dataset" rule and
@@ -248,7 +248,7 @@ impl QueryPlan {
                     None
                 } else {
                     // The one home for `--limit 0 = all rows`
-                    // (docs/history/TODO.md Bug 1): 0 suppresses both the
+                    // --limit 0 suppresses both the
                     // explicit limit and the config default.
                     match opts.limit {
                         Some(0) => None,
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn limit_zero_means_all_rows() {
-        // Regression (docs/history/TODO.md Bug 1): --limit 0 must fetch all
+        // Regression: --limit 0 must fetch all
         // rows, not zero, and must not fall back to the config default limit.
         let o = opts_with(|o| o.limit = Some(0));
         let plan = QueryPlan::from(Some(&o), Some(1000), None).unwrap();

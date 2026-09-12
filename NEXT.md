@@ -23,9 +23,9 @@ The intended direction is:
   drain shutdown, `jobs`/`cancel`). Not yet: capability negotiation, executor
   heartbeat, interrupted-job recovery, progress channel.
 - **Slice 2 (lifecycle & data correctness)**: partially implemented —
-  server-side filtering and offset pushdown landed (P6/P6.2 in
-  `docs/history/refactor-plan.md`: the bridge filters/pages while iterating,
-  the client pipeline re-runs authoritatively; 2.7× faster filtered queries,
+  server-side filtering and offset pushdown landed: the bridge
+  filters/pages while iterating, the client pipeline re-runs
+  authoritatively; 2.7× faster filtered queries,
   O(offset+limit) paging on 34k-symbol programs). Still not implemented: no
   `project verify`, no unified result envelope, no artifact manifest, no
   streaming (JSONL) output.
@@ -38,7 +38,10 @@ The intended direction is:
   (4.3), machine-readable capabilities (4.4).
 - **Slice 5 (RE-native bulk export/apply)**: not implemented. (A real
   cross-program `diff programs` via Google binDiff landed in 0.4.0 — a
-  standalone feature outside the slices, see `README.md`.)
+  standalone feature outside the slices, see `README.md`. Its P8 scale risk
+  was closed on 2026-09-12: a real cross-version firmware pair (5,194
+  functions) diffed in 6.4 s; that validation surfaced correctness bugs B1–B7,
+  all fixed and released in 0.4.1 — see the 0.4.1 section of `CHANGELOG.md`).)
 
 ## Implemented now: responsive bridge control plane
 
@@ -241,9 +244,9 @@ other settings that materially affect the resulting database.
 
 ### The old statement is too broad
 
-`docs/history/plan-java-plugin.md` says that Ghidra headless is single-threaded for program
-access and therefore makes the socket accept loop sequential. This conflates
-three different questions:
+The earlier Python→Java migration notes said that Ghidra headless is
+single-threaded for program access and therefore makes the socket accept loop
+sequential. This conflates three different questions:
 
 1. Can Ghidra itself use multiple threads? Yes. `AutoAnalysisManager` has an
    analysis thread and a shared analysis worker pool, and `analyzeHeadless`

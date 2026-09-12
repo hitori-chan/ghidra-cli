@@ -2044,6 +2044,17 @@ public class GhidraCliBridge extends GhidraScript {
             MessageLog log = new MessageLog();
             Object consumer = project;
 
+            // Snapshot of the root folder before the import so the created
+            // file(s) can be identified afterwards. The AutoImporter suffixes
+            // a colliding file name ("x.0"), so looking the file up by the
+            // binary's file name after the import can return the WRONG
+            // (pre-existing) program, which then gets renamed or blocked as
+            // "in use" — the new program is left orphaned under the suffix.
+            java.util.Set<String> namesBefore = new HashSet<>();
+            for (DomainFile f : project.getProjectData().getRootFolder().getFiles()) {
+                namesBefore.add(f.getName());
+            }
+
             // Ghidra 12+ API: importByUsingBestGuess(File, Project, String, Object, MessageLog, TaskMonitor)
             Object loadResults = AutoImporter.importByUsingBestGuess(
                 binaryFile, project, "/", consumer, log, mon
@@ -2087,20 +2098,38 @@ public class GhidraCliBridge extends GhidraScript {
             // name; rename it to the requested --program name, which is what
             // clients use with open_program afterwards. Failures here are
             // errors, not warnings: the caller will look for the program under
-            // the requested name.
+            // the requested name. The rename target is the file this import
+            // actually created (by name-set diff), not a lookup by file name
+            // (a colliding file name resolves to the pre-existing program).
             if (programName != null && !programName.isEmpty()
                     && !programName.equals(binaryFile.getName())) {
-                DomainFile target = project.getProjectData().getFile("/" + binaryFile.getName());
-                if (target == null) {
-                    return errorResult("Imported program not found in project (expected: "
-                            + binaryFile.getName() + ")");
+                DomainFile target = null;
+                for (DomainFile f : project.getProjectData().getRootFolder().getFiles()) {
+                    if (!namesBefore.contains(f.getName())) {
+                        target = f;
+                    }
                 }
+                if (target == null) {
+                    return errorResult("Import succeeded but the created program could not be located in the project root");
+                }
+                String actualName = target.getName();
                 try {
                     target.setName(programName);
                 } catch (Exception renameEx) {
-                    return errorResult("Import succeeded as '" + binaryFile.getName()
+                    // Remove the half-imported program so the project does not
+                    // keep an orphan under the auto-suffixed name.
+                    try { target.delete(target.getVersion()); } catch (Exception ignore) {}
+                    return errorResult("Import succeeded as '" + actualName
                             + "' but rename to '" + programName + "' failed: "
-                            + renameEx.getMessage());
+                            + renameEx.getMessage() + " (imported program removed)");
+                }
+                // Verify via a fresh lookup: the file object may cache its
+                // name across the pending rename.
+                if (project.getProjectData().getFile("/" + programName) == null) {
+                    // The rename did not take; remove the orphan under the
+                    // auto-suffixed name rather than leaving it behind.
+                    try { target.delete(target.getVersion()); } catch (Exception ignore) {}
+                    return errorResult("Rename to '" + programName + "' reported success but no program with that name exists in the project (imported program removed)");
                 }
             }
 
@@ -2212,25 +2241,37 @@ public class GhidraCliBridge extends GhidraScript {
 
                 // Add analysis metadata
                 if (isCurrent && currentProgram != null) {
-                    // For current program, use live data
+                    // For current program, use live data (the "Analyzed" flag
+                    // is the program's own marker, not a count heuristic).
                     FunctionManager fm = currentProgram.getFunctionManager();
                     int funcCount = countPrimaryFunctions(fm);
                     prog.addProperty("function_count", funcCount);
-                    prog.addProperty("analyzed", funcCount > 1);
+                    prog.addProperty("analyzed", GhidraProgramUtilities.isAnalyzed(currentProgram));
                     prog.addProperty("executable_format", currentProgram.getExecutableFormat());
                 } else {
-                    // For other programs, use DomainFile metadata
+                    // For other programs, use DomainFile metadata. Both values
+                    // are CACHED at the program's last save: the count can lag
+                    // the live program (analysis after the last save), so it is
+                    // only an estimate, and `analyzed` comes from the program's
+                    // own "Analyzed" flag, not derived from the count.
+                    // (Live data: open the program or use `program info`.)
                     try {
                         java.util.Map<String, String> metadata = domainFile.getMetadata();
                         if (metadata != null) {
                             String funcCountStr = metadata.get("# of Functions");
                             int funcCount = 0;
+                            boolean hasCount = false;
                             if (funcCountStr != null) {
-                                try { funcCount = Integer.parseInt(funcCountStr.trim()); }
+                                try { funcCount = Integer.parseInt(funcCountStr.trim()); hasCount = true; }
                                 catch (NumberFormatException ignored) {}
                             }
-                            prog.addProperty("function_count", funcCount);
-                            prog.addProperty("analyzed", funcCount > 1);
+                            if (hasCount) {
+                                prog.addProperty("function_count", funcCount);
+                            }
+                            String analyzedStr = metadata.get("Analyzed");
+                            if (analyzedStr != null) {
+                                prog.addProperty("analyzed", Boolean.parseBoolean(analyzedStr.trim()));
+                            }
                             String exeFmt = metadata.get("Executable Format");
                             if (exeFmt != null) {
                                 prog.addProperty("executable_format", exeFmt);
@@ -4592,6 +4633,14 @@ public class GhidraCliBridge extends GhidraScript {
             return errorResult("program2 not found in project: " + prog2Name
                 + ". Available programs: " + availableProgramNames());
         }
+        // A corrupted rename can leave two domain files whose internal program
+        // names are identical even though their file names differ. The export
+        // files below are named to match each other only in that case, which
+        // would silently turn the diff into a self-comparison — refuse it.
+        if (p1.getName().equals(p2.getName())) {
+            return errorResult("program1 and program2 have the same program name \""
+                + p1.getName() + "\"; rename one of the programs in the project first");
+        }
 
         if (jarPath == null || jarPath.isEmpty()) {
             return errorResult("BinDiff is not configured: set bindiff.binexport_jar in the ghidra-cli config to the plain (non-OSGi) BinExport.jar");
@@ -4610,8 +4659,11 @@ public class GhidraCliBridge extends GhidraScript {
                 File dir = File.createTempFile("gd-bindiff-", "");
                 dir.delete();
                 dir.mkdirs();
-                out1 = new File(dir, p1.getName() + ".BinExport");
-                out2 = new File(dir, p2.getName() + ".BinExport");
+                // Fixed, distinct names: program names can collide (see the
+                // guard above) and a shared file name would make export2
+                // overwrite export1, silently self-comparing the diff.
+                out1 = new File(dir, "program1.BinExport");
+                out2 = new File(dir, "program2.BinExport");
 
                 JarFile jarFile = new JarFile(jarFileObj);
                 try {

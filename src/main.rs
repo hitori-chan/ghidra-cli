@@ -122,7 +122,9 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
         // Non-bridge commands
         Commands::Init => cmd::maintenance::handle_init(),
-        Commands::Doctor => cmd::maintenance::handle_doctor(&cli.projects_dir),
+        Commands::Doctor { clear_stale_locks } => {
+            cmd::maintenance::handle_doctor(&cli.projects_dir, *clear_stale_locks)
+        }
         Commands::Version => cmd::maintenance::handle_version(),
         Commands::Config(cmd) => cmd::maintenance::handle_config_command(cmd.clone()),
         Commands::SetDefault(args) => cmd::maintenance::handle_set_default(args.clone()),
@@ -207,7 +209,7 @@ fn run_with_bridge(cli: Cli) -> anyhow::Result<()> {
 
     // Build the query plan up front, before any bridge work: a malformed
     // --filter must fail now — the fetch for a filtered query pulls the full
-    // dataset, so failing late wastes that transfer (docs/history/TODO.md Bug 2).
+    // dataset, so failing late wastes that transfer.
     let mut exec_ctx = cmd::ExecCtx::for_command(
         cli.quiet,
         config.default_limit,
@@ -629,7 +631,7 @@ mod tests {
 
     #[test]
     fn describe_query_error_mentions_filter_usage() {
-        // Regression (`docs/history/TODO.md` Bug 2): a bare word is not a valid filter and the
+        // Regression: a bare word is not a valid filter and the
         // error must surface (previously swallowed, dumping the whole dataset).
         let Err(err) = filter::Filter::parse("PK") else {
             panic!("bare word must not parse");

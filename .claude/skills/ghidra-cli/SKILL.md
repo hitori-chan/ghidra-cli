@@ -95,7 +95,10 @@ gd analyze [--project P] [--program PROG] [--detach]
 
 Both auto-start the bridge. `gd import` runs auto-analysis by default (and
 persists the program); pass `--no-analyze` for a raw import without analysis.
-`--detach` returns immediately.
+`--detach` returns immediately. `--program NAME` is honored on every import
+path (new project, existing project, name collision — a colliding name
+renames the newly imported file and removes it if the rename fails; it never
+orphan-programs or touches an existing program).
 
 ### Program Management
 
@@ -337,6 +340,8 @@ gd patch export -o OUTPUT [--project P] [--program PROG]
 
 `--count N` NOPs N consecutive instructions from ADDRESS (default 1), walking instruction by instruction. If any address in the run has no instruction, the whole patch rolls back.
 
+**Do not re-import** `program export binary` / `patch export` output: the re-serialized ELF is for patching/diffing only and can be degenerate for some firmwares (NULL section headers, no `.dynstr`) — re-importing such a file degrades the program (lost executable memory, 0 functions).
+
 ### Script Execution
 
 ```bash
@@ -379,7 +384,10 @@ gd stats [QUERY_OPTS]
 
 ```bash
 gd init                       # create config
-gd doctor                     # check installation
+gd doctor                     # check installation: Ghidra, JDK (javac), bridge-script compile,
+                              #   bridge state (sweeps stale port/PID files), project locks
+gd doctor --clear-stale-locks # also remove stale project lock files (e.g. after a SIGKILLed bridge)
+gd version
 gd version
 gd config list
 gd config get KEY

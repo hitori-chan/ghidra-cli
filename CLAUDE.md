@@ -20,7 +20,6 @@ See @AGENTS.md for agent-specific instructions.
 | `src/ghidra/scripts/GhidraCliBridge.java` | Java bridge server (TCP, command handlers, Ghidra API) |
 | `src/ipc/client.rs` | BridgeClient (TCP connection, command methods) |
 | `src/ipc/protocol.rs` | BridgeRequest/BridgeResponse wire format |
-| `docs/history/plan-java-plugin.md` | Historical: Python→Java bridge migration decisions and rationale |
 | `README.md` | Understanding project architecture or user-facing command documentation |
 
 ## Modules
@@ -42,7 +41,6 @@ See @AGENTS.md for agent-specific instructions.
 |------|------|
 | `CHANGELOG.md` | Reviewing version history and release notes |
 | `.claude/skills/ghidra-cli/SKILL.md` | Full command reference for AI agents (all commands, query options, workflows) |
-| `docs/history/refactor-plan.md` | Complete (0.4.0): P0–P8 design record — pushdown rules, envelope table, bridge registry, binDiff integration |
 | `PLAN.md` / `NEXT.md` | Active roadmap (slices 2–5: verify, envelope, corpus scheduler, module runtime) |
 | `src/ghidra/README.md` | Understanding bridge lifecycle, PID file sequence, TOCTOU elimination, BridgeClient adoption |
 | `src/ipc/README.md` | Understanding TCP wire format, BridgeClient API, single implementation rationale |

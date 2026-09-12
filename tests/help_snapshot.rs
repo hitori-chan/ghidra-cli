@@ -1,7 +1,7 @@
 //! Help-output snapshots: the CLI surface is a stable contract for agents and
 //! scripts. These capture the top-level command tree and the help pages of
 //! the command groups whose argument surface was restructured in the
-//! CommandMeta/TargetArgs refactor (docs/history/refactor-plan.md P1).
+//! CommandMeta/TargetArgs refactor.
 //!
 //! If a snapshot fails, the help text changed: review the diff deliberately
 //! and update the snapshot (`INSTA_UPDATE=always cargo test --test

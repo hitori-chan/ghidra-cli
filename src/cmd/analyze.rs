@@ -1,6 +1,7 @@
-//! Import & analyze bridge commands (docs/history/refactor-plan.md P1: split from
+//! Import & analyze bridge commands (split from
 //! `run_with_bridge`/`execute_via_bridge` in main.rs).
 
+use anyhow::Context;
 use crate::cli::Commands;
 use crate::ghidra::bridge::{self, BridgeStartMode};
 use crate::ghidra::project_has_program_data;
@@ -100,7 +101,41 @@ pub fn import(
         // whose program persistence depended on HeadlessAnalyzer's
         // post-script teardown commit — a commit `stop` could kill
         // mid-write (the macOS "program file(s) not found" failures).
-        let name = bridge::import_oneshot(project_path, binary_path, ghidra_install_dir)?;
+        //
+        // The one-shot names the program after the binary's file name and has
+        // no rename option, and a program file created by a previous JVM
+        // session cannot be renamed from a later one (the local project store
+        // holds it "in use"), so --program is honored by staging the binary
+        // under the requested name BEFORE the import: hard link when possible,
+        // copy otherwise. The staged file is removed after the import reads it.
+        let bin_file_name = binary_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let (staged_path, staged) = match args.program.as_deref() {
+            Some(p) if !p.is_empty() && p != bin_file_name => {
+                let staging_dir = std::env::temp_dir()
+                    .join(format!("gd-import-stage-{}", std::process::id()));
+                std::fs::create_dir_all(&staging_dir)
+                    .with_context(|| format!("Failed to create staging dir {}", staging_dir.display()))?;
+                let staged = staging_dir.join(p);
+                if staged.exists() {
+                    std::fs::remove_file(&staged).ok();
+                }
+                if std::fs::hard_link(binary_path, &staged).is_err() {
+                    std::fs::copy(binary_path, &staged)
+                        .with_context(|| format!("Failed to stage binary at {}", staged.display()))?;
+                }
+                (staged.clone(), true)
+            }
+            _ => (binary_path.to_path_buf(), false),
+        };
+        let file_name = bridge::import_oneshot(project_path, &staged_path, ghidra_install_dir)?;
+        if staged {
+            // The import has read the staged file; drop it (and the dir).
+            let _ = std::fs::remove_file(&staged_path);
+            let _ = std::fs::remove_dir_all(staged_path.parent().unwrap_or(std::path::Path::new("")));
+        }
         if !quiet {
             eprintln!("Starting Ghidra bridge...");
         }
@@ -108,12 +143,12 @@ pub fn import(
             project_path,
             ghidra_install_dir,
             BridgeStartMode::Process {
-                program_name: name.clone(),
+                program_name: file_name.clone(),
             },
         )?;
         let client = BridgeClient::new(port);
-        client.open_program(&name)?;
-        (client, name)
+        client.open_program(&file_name)?;
+        (client, file_name)
     };
 
     // Run analysis as an UNBOUNDED operation unless the user opted out.

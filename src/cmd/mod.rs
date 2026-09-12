@@ -1,4 +1,4 @@
-//! Bridge command execution, split by command group (docs/history/refactor-plan.md P1).
+//! Bridge command execution, split by command group.
 //!
 //! Each module's `run` handles one group of `Commands`; `execute` is the only
 //! place group membership is decided.

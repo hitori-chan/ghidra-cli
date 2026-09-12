@@ -851,6 +851,18 @@ pub fn stop_bridge(project_path: &Path) -> Result<()> {
     // Clean up files
     cleanup_stale_files(project_path)?;
 
+    // Final verification: if the tracked pid is still alive, do not claim
+    // success — a live bridge means the project lock is still held and the
+    // next command will fail confusingly.
+    if let Some(pid) = pid {
+        if is_pid_alive(pid) {
+            return Err(anyhow::anyhow!(
+                "Bridge process {} is still running after stop; re-run `gd stop` or kill it manually",
+                pid
+            ));
+        }
+    }
+
     info!("Bridge stopped");
     Ok(())
 }

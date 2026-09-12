@@ -362,7 +362,11 @@ pub enum Commands {
     Version,
 
     /// Check Ghidra installation
-    Doctor,
+    Doctor {
+        /// Remove stale project lock files (locks not held by any live process)
+        #[arg(long)]
+        clear_stale_locks: bool,
+    },
 
     /// Initialize configuration
     Init,
@@ -1864,7 +1868,7 @@ mod tests {
         })
         .requires_bridge());
         // ...while management commands do not (fail-closed default).
-        assert!(!Commands::Doctor.requires_bridge());
+        assert!(!Commands::Doctor { clear_stale_locks: false }.requires_bridge());
         assert!(!Commands::Init.requires_bridge());
         assert!(!Commands::Project(ProjectArgs {
             command: ProjectCommands::List,

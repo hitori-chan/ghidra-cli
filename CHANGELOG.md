@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+(nothing yet)
+
+## [0.4.1] - 2026-09-12
+
+Post-release correctness fixes found during the 0.4.0 scale validation
+(real cross-version firmware: 2,390 + 2,804 functions diffed in 6.4 s,
+1,834 matches with exact accounting).
+
+### Fixed
+
+- **`diff programs` no longer silently self-compares** when two programs
+  share an internal name (the classic symptom: a results table where every
+  row has similarity 1.0). The bridge now rejects identical source program
+  names with an error that names both project paths, exports under fixed
+  file names (`program1.BinExport` / `program2.BinExport`) so exports can
+  never overwrite each other, and the CLI additionally bails when both
+  export paths resolve to the same file. (B1, critical.)
+- **`import --program NAME` with a colliding name no longer fails or
+  orphans data.** Previously the import succeeded as `NAME.0`, the rename
+  then failed with "NAME is in use", and the orphaned program stayed in
+  the project (that corrupted state was what triggered the B1
+  self-comparison). The bridge now identifies the newly imported file by
+  name-set diff (the requested name is never guessed at), renames that
+  file, and deletes the imported file if the rename fails. (B2, high.)
+- **`import <bin> --program NAME` is honored on brand-new (one-shot)
+  projects.** The one-shot import names the program after the binary's
+  file name and has no rename option, and a program file created by a
+  previous JVM session cannot be renamed from a later one (the local
+  project store holds it "in use"), so the CLI stages the binary under the
+  requested name (hard link, copy fallback) before importing and removes
+  the staging file afterwards. (B4, medium.)
+- **`program list` reports honest `analyzed` status.** It now reads
+  Ghidra's real "Analyzed" flag — live for the current program, from the
+  program's stored metadata for non-current programs — instead of
+  deriving it from a possibly stale function count. `function_count` is
+  the live count for the current program and the cached metadata count
+  for non-current programs (documented as such). (B3, medium.)
+- **`gd stop` no longer claims success while the bridge is still alive.**
+  After the SIGTERM/SIGKILL escalation it verifies the process actually
+  exited and fails otherwise, so a surviving JVM (and its held project
+  lock) can't be papered over. (B6, medium.)
+- **`gd doctor` gained lifecycle hygiene checks.** Bridge state: stale
+  `bridge-*.port`/`.pid` pairs are removed (a live port ping is the
+  authority, so reused PIDs can't mask stale files). Project locks:
+  Ghidra keeps the channel-lock file `X.lock~` open for the lifetime of a
+  project lock, so locks whose file descriptor belongs to no live process
+  are reported stale with their age; `gd doctor --clear-stale-locks`
+  removes them. This is the recovery path after a SIGKILLed bridge left a
+  project locked with no bridge running. (B6, medium.)
+- **E2E import test now verifies the imported program is analyzed**
+  (exact `--program` name honored, `analyzed: true`, nonzero function
+  count, program is current, old name absent) instead of only asserting
+  the import/delete succeeded. (B5, medium.)
+
+### Changed
+
+- Docs: `program export binary` and `patch export` output is documented as
+  being for patching/diffing, **not for re-importing** — for some firmwares
+  the re-serialized ELF is degenerate (NULL section headers, no `.dynstr`)
+  and re-importing it degrades the program (lost executable memory,
+  0 functions). A round-trippable ELF re-serializer is tracked as a
+  follow-up, not part of 0.4.1. (B7, low.)
+
 ## [0.4.0]
 
 ### Added

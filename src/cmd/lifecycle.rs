@@ -1,4 +1,4 @@
-//! Bridge lifecycle management commands (docs/history/refactor-plan.md P1: start/stop/
+//! Bridge lifecycle management commands (start/stop/
 //! status/ping/jobs/cancel handlers, moved from main.rs).
 
 use crate::cli::Cli;

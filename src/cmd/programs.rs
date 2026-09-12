@@ -175,6 +175,15 @@ fn run_diff_programs(
         .get("export2")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("bridge response missing export2"))?;
+    // Two exports must be two distinct files: a shared path would mean the
+    // second export overwrote the first and the differ would compare the
+    // program against itself (plausible-looking but wrong output).
+    if export1 == export2 {
+        anyhow::bail!(
+            "BinDiff export failed: both programs exported to the same file ({}) — the programs have colliding names; rename one in the project first",
+            export1
+        );
+    }
 
     // 2. Native differ: .BinExport pair -> .BinDiff SQLite DB.
     let differ = bindiff::find_differ(cfg).map_err(|e| anyhow::anyhow!("{}", e))?;

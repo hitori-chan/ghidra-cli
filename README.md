@@ -20,6 +20,7 @@ A Rust CLI for automating Ghidra reverse engineering tasks. Usable directly by h
 - **Script execution** - Run checked-in Java Ghidra scripts with real positional args and `--expect` artifact gates
 - **Batch operations** - Execute multiple commands from a file
 - **Responsive job control** - Long analyses run on a serialized program lane while `ping`, `status`, `jobs`, and `cancel` stay live on a separate control plane
+- **Lifecycle hygiene** - `gd stop` verifies the bridge process actually exited; `gd doctor` sweeps stale bridge port/PID files and detects stale project locks (`--clear-stale-locks` removes them)
 - **Flexible output** - Human-readable, JSON, or pretty JSON formats
 - **Filtering** - Expression-based filtering with a small DSL (e.g., `size > 100 AND name ~ 'crypt'`)
 
@@ -134,6 +135,13 @@ gd program open --program NAME     # Switch to a program (close/delete take --pr
 gd program export FORMAT -o OUT    # Export current program (binary, c/cpp, xml, json, …)
 gd rename OLD NEW                  # Rename a symbol (shortcut for symbol rename)
 ```
+
+> **`program export binary` caveat:** the re-serialized ELF is for
+> patching and diffing, **not for re-importing**. For some firmwares it
+> writes a degenerate ELF (e.g. NULL section headers, no `.dynstr`), and
+> re-importing such an export degrades the program (lost executable
+> memory, 0 functions). To compare firmware versions, import the
+> original binaries and use `gd diff programs`.
 
 ### Generic Query & Dump
 
@@ -509,14 +517,39 @@ WSL requires X11 libraries even for headless operation because Java AWT is loade
 Use the doctor command to verify your installation:
 
 ```bash
-gd doctor
+gd doctor                       # full health check
+gd doctor --clear-stale-locks   # also remove stale project lock files
 ```
 
 This checks:
-- Ghidra installation directory
-- analyzeHeadless availability
-- Project directory configuration
-- Config file status
+- Ghidra installation directory and `analyzeHeadless` availability
+- Java: a full JDK (not a JRE) of the right version, with `javac`
+- Bridge script compile check (the embedded Java script compiles against the
+  installed Ghidra — catches API incompatibilities early)
+- Project directory and config file status
+- Bridge state: stale `bridge-*.port`/`.pid` files are removed automatically
+  (a live port ping is the authority, so a reused PID can't mask stale files)
+- Project locks: Ghidra keeps the channel-lock file `X.lock~` open for the
+  lifetime of a project lock; locks with no owning process are reported as
+  stale (with age) and removed with `--clear-stale-locks`
+
+#### Stale Project Lock ("is in use" with no bridge running)
+
+If a bridge JVM was SIGKILLed (or the machine rebooted), the project can keep
+a stale lock: commands then fail with "is in use" even though nothing is
+running. Recovery:
+
+```bash
+gd doctor --projects-dir <dir>           # shows the stale lock + age
+gd doctor --projects-dir <dir> --clear-stale-locks   # removes it
+```
+
+Only do this when you are sure no Ghidra session (GUI or bridge) has the
+project open.
+
+Note: a `gd stop` reports success only after the bridge process is confirmed
+exited; if the bridge somehow survives, `gd stop` fails loudly instead of
+leaving you with a zombie holding the project lock.
 
 ## Contributing
 

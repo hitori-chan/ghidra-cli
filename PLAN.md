@@ -22,15 +22,13 @@ real method on the classpath the bridge already compiles against.
 - **4.4 machine-readable capabilities** (capability handshake): not
   implemented.
 - **Slice 3 durable corpus scheduler**: not implemented — the next major
-  project (see `NEXT.md` status and "Open follow-ups" in
-  `docs/history/refactor-plan.md`).
+  project (see `NEXT.md` status).
 - **§0.1 result envelope / §0.2 provenance**: not implemented; the pragmatic
-  first step (CLI-side envelope table) landed as P3
-  (`docs/history/refactor-plan.md`).
+  first step (CLI-side envelope table) landed as P3 in 0.4.0.
 - **Slice 2 items**: server-side filtering is now substantially implemented —
-  exact/superset filter pushdown and server-side `--offset` (P6/P6.2, see
-  `docs/history/refactor-plan.md`), with the client pipeline re-running
-  authoritatively. `project verify` and the result envelope remain.
+  exact/superset filter pushdown and server-side `--offset` (P6/P6.2 in 0.4.0),
+  with the client pipeline re-running authoritatively. `project verify` and
+  the result envelope remain.
 
 ---
 
