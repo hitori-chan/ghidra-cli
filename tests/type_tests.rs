@@ -26,7 +26,7 @@ fn test_type_list() {
     require_ghidra!();
     let _harness = harness();
 
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .arg("type")
         .arg("list")
         .arg("--project")
@@ -43,7 +43,7 @@ fn test_type_get_primitive() {
     require_ghidra!();
     let _harness = harness();
 
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .arg("type")
         .arg("get")
         .arg("int")
@@ -62,7 +62,7 @@ fn test_type_create() {
     require_ghidra!();
     let _harness = harness();
 
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .arg("type")
         .arg("create")
         .arg("MyTestStruct")
@@ -74,7 +74,7 @@ fn test_type_create() {
         .success();
 
     // Verify created type exists
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .arg("type")
         .arg("get")
         .arg("MyTestStruct")
@@ -95,7 +95,7 @@ fn test_type_apply() {
 
     let addr = get_function_address(harness, TEST_PROJECT, TEST_PROGRAM, "main");
 
-    let output = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    let output = assert_cmd::cargo::cargo_bin_cmd!("gd")
         .arg("type")
         .arg("apply")
         .arg(&addr)
@@ -124,7 +124,7 @@ fn test_type_get_nonexistent() {
     require_ghidra!();
     let _harness = harness();
 
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .arg("type")
         .arg("get")
         .arg("NonexistentType12345")

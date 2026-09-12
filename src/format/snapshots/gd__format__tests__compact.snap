@@ -1,0 +1,12 @@
+---
+source: src/format/mod.rs
+expression: "f.format(&rows, fmt).unwrap()"
+---
+00401000  main  (78)  tags=[entry, auth]
+undefined main(void)
+int main() {
+  return 0;
+}
+00401010     55               PUSH RBP
+00118b43  block=.text  ldr_refs=[]  zero_block=false
+00401000  main  call_site=00401005  depth=1

@@ -198,7 +198,7 @@ impl GhidraCommand {
 
     /// Run the command and return result.
     pub fn run(self) -> GhidraResult {
-        let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("ghidra");
+        let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gd");
 
         for (key, value) in &self.env_vars {
             cmd.env(key, value);

@@ -1,0 +1,8 @@
+---
+source: src/format/mod.rs
+expression: "f.format(&rows, OutputFormat::Tree).unwrap()"
+---
+main
+  helper
+    loop_fn
+      helper (…)

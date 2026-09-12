@@ -23,6 +23,28 @@ use std::sync::Once;
 use std::time::Duration;
 
 /// Get path to the sample_binary test fixture.
+/// The shared test project directory: always under the system temp dir,
+/// never in $HOME (the CLI's Linux default, `~/ghidra-cli-projects`, would
+/// otherwise be polluted by every test run).
+///
+/// All resolution paths — this helper, the in-process `Config`, and the
+/// `gd` subprocesses — must agree, so `init_test_env` pins the
+/// `GHIDRA_PROJECT_DIR` override in the test process; subprocesses inherit it.
+pub fn test_projects_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("ghidra-cli-ci-projects");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Pin project resolution to the temp test dir once per test process.
+/// Idempotent; call before any project-path resolution.
+pub fn init_test_env() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        std::env::set_var("GHIDRA_PROJECT_DIR", test_projects_dir());
+    })
+}
+
 pub fn fixture_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -36,6 +58,7 @@ pub fn fixture_binary() -> PathBuf {
 pub fn ensure_test_project(project: &str, program: &str) {
     static SETUP: Once = Once::new();
     SETUP.call_once(|| {
+        init_test_env();
         let binary = fixture_binary();
         if !binary.exists() {
             panic!(
@@ -114,7 +137,7 @@ pub fn ensure_test_project(project: &str, program: &str) {
         // When ghidra.exe exits, the pipe stays open (JVM holds inherited handles),
         // so output()/wait_with_output() blocks forever. Using null avoids this.
         eprintln!("Step 1: Importing binary {:?} ...", binary);
-        let ghidra_bin = assert_cmd::cargo::cargo_bin!("ghidra");
+        let ghidra_bin = assert_cmd::cargo::cargo_bin!("gd");
         let import_status = run_cli_with_timeout(
             ghidra_bin,
             &[
@@ -210,6 +233,7 @@ impl DaemonTestHarness {
     /// detailed error messages (e.g., "program file(s) not found") propagate
     /// correctly to callers like try_start_daemon().
     pub fn new(project: &str, program: &str) -> Result<Self> {
+        init_test_env();
         let data_dir = get_unique_data_dir();
 
         // Resolve the project path (must match the CLI's default via get_project_dir)
@@ -362,7 +386,7 @@ pub fn run_cli_with_timeout(
 #[macro_export]
 macro_rules! require_ghidra {
     () => {
-        let doctor = assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+        let doctor = assert_cmd::cargo::cargo_bin_cmd!("gd")
             .arg("doctor")
             .output()
             .expect("Failed to run ghidra doctor");

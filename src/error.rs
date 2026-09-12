@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum GhidraError {
-    #[error("Ghidra installation not found. Set GHIDRA_INSTALL_DIR or run 'ghidra init'")]
+    #[error("Ghidra installation not found. Set GHIDRA_INSTALL_DIR or run 'gd init'")]
     GhidraNotFound,
 
     #[error("Failed to parse filter: {0}")]
@@ -13,10 +13,6 @@ pub enum GhidraError {
 
     #[error("Invalid format: {0}")]
     InvalidFormat(String),
-
-    #[allow(dead_code)]
-    #[error("Invalid data type: {0}")]
-    InvalidDataType(String),
 
     #[error("Configuration error: {0}")]
     ConfigError(String),

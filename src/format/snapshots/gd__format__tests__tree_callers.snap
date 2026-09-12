@@ -1,0 +1,6 @@
+---
+source: src/format/mod.rs
+expression: "f.format(&rows, OutputFormat::Tree).unwrap()"
+---
+main @ 00401005 (00401000)
+  helper @ 00401060 (00401050)

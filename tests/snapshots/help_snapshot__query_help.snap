@@ -1,0 +1,29 @@
+---
+source: tests/help_snapshot.rs
+assertion_line: 91
+expression: "help(&[\"query\", \"--help\"])"
+---
+Universal query command for any data type
+
+Usage: gd query [OPTIONS] <DATA_TYPE>
+
+Arguments:
+  <DATA_TYPE>  Data type to query (functions, strings, imports, etc.)
+
+Options:
+      --program <PROGRAM>            Target program [env: GHIDRA_DEFAULT_PROGRAM=]
+      --project <PROJECT>            Project name [env: GHIDRA_DEFAULT_PROJECT=]
+  -f, --filter <FILTER>              Filter expression: <field><op><value>, e.g. 'name~PK' (contains), 'name=~"^PK_"' (regex), 'size>100'. Ops: = != > >= < <= ~ ^ $ =~. Combine with AND/OR/NOT. Bare words are rejected
+      --fields <FIELDS>              Field selection (comma-separated)
+  -o, --format <FORMAT>              Output format (full, compact, minimal, json, json-compact, json-stream, csv, tsv, table, ids, count, tree, asm, c)
+      --limit <LIMIT>                Maximum number of results (0 = unlimited; default 1000)
+      --offset <OFFSET>              Skip first N results
+      --sort <SORT>                  Sort by field(s) (comma-separated, prefix with - for descending)
+      --count                        Only return count
+      --json                         Output as JSON (shorthand for --format=json)
+  -v, --verbose...                   Increase log verbosity printed to stdout (-v=warn, -vv=info, -vvv=debug)
+  -q, --quiet                        Suppress non-essential output
+      --pretty                       Output JSON with pretty formatting
+      --projects-dir <PROJECTS_DIR>  Directory under which Ghidra projects are stored. Overrides config `ghidra_project_dir` and the default location. Note: Ghidra 12.1+ rejects paths containing a dot-prefixed component
+      --java-home <JAVA_HOME>        Full JDK home for Ghidra to use (must be a JDK, not a JRE). Overrides config `java_home` and auto-detection
+  -h, --help                         Print help

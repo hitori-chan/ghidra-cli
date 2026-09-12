@@ -9,6 +9,29 @@ All Ghidra API signatures below were verified with `javap` against the installed
 `ghidra_12.1.2_PUBLIC` (`Base.jar`) and JDK 21. Anything marked "verified" is a
 real method on the classpath the bridge already compiles against.
 
+## Implementation status (2026-09-12, v0.4.0)
+
+- **4.1 script `run` with args + `--expect`/`--allow-empty`**: implemented
+  (bridge `handleScriptRun`).
+- **4.2 artifact contract**: partial — the `--expect` row check exists; no
+  artifact manifest (`schema`/`rows`/`sha256`) and no atomic write yet.
+- **4.3 module runtime**: not implemented.
+- **4.4 capability honesty**: done — `script java`/`script python` return
+  clean capability errors in the bridge, and README/SKILL.md no longer
+  advertise inline snippets (only `script run` with class-form Java files).
+- **4.4 machine-readable capabilities** (capability handshake): not
+  implemented.
+- **Slice 3 durable corpus scheduler**: not implemented — the next major
+  project (see `NEXT.md` status and "Open follow-ups" in
+  `docs/history/refactor-plan.md`).
+- **§0.1 result envelope / §0.2 provenance**: not implemented; the pragmatic
+  first step (CLI-side envelope table) landed as P3
+  (`docs/history/refactor-plan.md`).
+- **Slice 2 items**: server-side filtering is now substantially implemented —
+  exact/superset filter pushdown and server-side `--offset` (P6/P6.2, see
+  `docs/history/refactor-plan.md`), with the client pipeline re-running
+  authoritatively. `project verify` and the result envelope remain.
+
 ---
 
 ## 0. Shared conventions (apply to both slices)

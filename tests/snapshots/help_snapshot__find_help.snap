@@ -1,0 +1,29 @@
+---
+source: tests/help_snapshot.rs
+expression: "help(&[\"find\", \"--help\"])"
+---
+Search operations
+
+Usage: gd find [OPTIONS] <COMMAND>
+
+Commands:
+  string       Find strings
+  bytes        Find byte patterns
+  constant     Find constant value references (byte scan + ARM LDR literal-pool refs)
+  instruction  Find instructions matching a text pattern (works without xrefs)
+  function     Find functions
+  calls        Find calls to function
+  crypto       Find crypto constants
+  interesting  Find interesting functions
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -v, --verbose...                   Increase log verbosity printed to stdout (-v=warn, -vv=info, -vvv=debug)
+  -q, --quiet                        Suppress non-essential output
+      --json                         Output as JSON
+      --pretty                       Output JSON with pretty formatting
+      --project <PROJECT>            Project name or path (can also be specified per-subcommand)
+      --program <PROGRAM>            Program name within the project (can also be specified per-subcommand)
+      --projects-dir <PROJECTS_DIR>  Directory under which Ghidra projects are stored. Overrides config `ghidra_project_dir` and the default location. Note: Ghidra 12.1+ rejects paths containing a dot-prefixed component
+      --java-home <JAVA_HOME>        Full JDK home for Ghidra to use (must be a JDK, not a JRE). Overrides config `java_home` and auto-detection
+  -h, --help                         Print help

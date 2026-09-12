@@ -1,0 +1,34 @@
+---
+source: tests/help_snapshot.rs
+expression: "help(&[\"function\", \"--help\"])"
+---
+Function operations
+
+Usage: gd function [OPTIONS] <COMMAND>
+
+Commands:
+  list                    List all functions
+  get                     Get function details
+  decompile               Decompile function
+  disasm                  Disassemble function
+  calls                   Get function calls
+  x-refs                  Get cross-references to function
+  rename                  Rename function
+  create                  Create function
+  delete                  Delete function
+  set-signature           Set function signature from C-style string
+  set-return-type         Set function return type
+  set-calling-convention  Set function calling convention
+  set-var-type            Set variable type in a function
+  help                    Print this message or the help of the given subcommand(s)
+
+Options:
+  -v, --verbose...                   Increase log verbosity printed to stdout (-v=warn, -vv=info, -vvv=debug)
+  -q, --quiet                        Suppress non-essential output
+      --json                         Output as JSON
+      --pretty                       Output JSON with pretty formatting
+      --project <PROJECT>            Project name or path (can also be specified per-subcommand)
+      --program <PROGRAM>            Program name within the project (can also be specified per-subcommand)
+      --projects-dir <PROJECTS_DIR>  Directory under which Ghidra projects are stored. Overrides config `ghidra_project_dir` and the default location. Note: Ghidra 12.1+ rejects paths containing a dot-prefixed component
+      --java-home <JAVA_HOME>        Full JDK home for Ghidra to use (must be a JDK, not a JRE). Overrides config `java_home` and auto-detection
+  -h, --help                         Print help

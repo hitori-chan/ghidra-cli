@@ -1,0 +1,14 @@
+---
+source: src/format/mod.rs
+assertion_line: 845
+expression: "f.format(&rows, fmt).unwrap()"
+---
+address	name	size	tags	code	entry	params	signature	variables	bytes	loaded	mnemonic	operands	block	ldr_refs	zero_block	call_site	depth
+00401000	main	78	entry;auth														
+	main			int main() {
+  return 0;
+}
+	00401000	{"name":"argc","storage":":RDI","type":"int"}	undefined main(void)	{"name":"lVar1","storage":":RAX","type":"long"}									
+00401010									55	{"value":"0x1505"}	PUSH	RBP					
+00118b43													.text		false		
+00401000	main															00401005	1

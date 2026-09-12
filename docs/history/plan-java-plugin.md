@@ -1,5 +1,11 @@
 # Plan: Replace Python Bridge with Java GhidraScript Socket Server
 
+> **Status: superseded** — historical record of the Python→Java bridge
+> migration, which is fully implemented. Details below (e.g. `-postScript`,
+> sequential single-connection handling, 300 s fixed timeout) no longer match
+> the current bridge; see `README.md` and `AGENTS.md` for the current
+> architecture.
+
 ## Overview
 
 Replace the current three-layer architecture (Rust CLI → Rust Daemon → Python bridge inside Ghidra JVM) with a two-layer architecture (Rust CLI → Java GhidraScript socket server inside Ghidra JVM). The Java GhidraScript runs via `analyzeHeadless -postScript`, starts a TCP socket server that keeps the JVM alive, and handles all 49 commands directly via the Ghidra Java API. The Rust side collapses: the persistent daemon process is eliminated, replaced by a thin "launcher" that starts `analyzeHeadless` if not running, writes a port+PID file, and then the CLI connects directly to the Java bridge's TCP socket.

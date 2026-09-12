@@ -2,6 +2,11 @@
 
 > Historical planning document: this plan captures prior design decisions and may not match current test architecture exactly.
 > For current test behavior and commands, see `tests/README.md`.
+>
+> ⚠️ **Policy conflict — do not follow**: this document prescribes
+> skip-when-Ghidra-missing behavior (`skip_if_no_ghidra!()`). That is forbidden;
+> AGENTS.md rule 1 requires tests to FAIL when Ghidra is absent. Use the
+> `require_ghidra!()` macro, which panics.
 
 ## Overview
 

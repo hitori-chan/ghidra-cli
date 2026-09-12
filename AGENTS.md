@@ -9,8 +9,12 @@
 
 ghidra-cli uses a **direct bridge architecture**:
 - CLI connects directly to a Java bridge running inside Ghidra's JVM via TCP
-- The bridge is a GhidraScript (`GhidraCliBridge.java`) started via `analyzeHeadless -postScript`
+- The bridge is a GhidraScript (`GhidraCliBridge.java`) started via `analyzeHeadless -preScript`
 - Bridge binds `ServerSocket(0)` on localhost, writes port/PID files for discovery
 - One bridge per project, identified by `~/.local/share/ghidra-cli/bridge-{md5}.port`
-- Import/Analyze commands auto-start the bridge if not running
+- Any command auto-starts the bridge if not running (import/analyze included)
 - No separate Rust daemon process — the Java bridge IS the persistent server
+
+## Optional third-party dependency
+
+- `gd diff programs` requires **Google binDiff**: the native differ (`bindiff.differ` config, `$BINDIFF_PATH`, `/opt/bindiff/bin`, or `PATH`) plus the plain (non-OSGi) `BinExport.jar` (`bindiff.binexport_jar` config, loaded by the bridge at runtime in a child-first classloader). Without it the command fails with setup instructions — that is intended, not a bug to work around.

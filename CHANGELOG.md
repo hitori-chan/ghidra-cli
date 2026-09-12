@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0]
+
+### Added
+
+- **`diff programs` is a real cross-program diff powered by Google
+  [binDiff](https://github.com/google/bindiff).** The bridge exports both
+  programs to BinExport (the plain `BinExport.jar` is loaded at runtime in a
+  child-first classloader), the native differ matches functions, and the CLI
+  reads back the `.BinDiff` SQLite database. Rows carry `name1`/`name2`,
+  `address1`/`address2`, `similarity`/`confidence` (3 decimals; 1.0 =
+  identical); a summary line reports matched/changed/unmatched counts and
+  overall similarity. New flags: `--changed` (only non-identical matches),
+  `--unmatched` (functions present in only one program, listed first so a row
+  cap always shows them), `--min-sim`, `--name`, `--limit`.
+  Requires the binDiff toolchain — the command fails with setup instructions
+  when it is absent: `gd config set bindiff.binexport_jar /path/to/BinExport.jar`
+  plus the native differ via `bindiff.differ`, `$BINDIFF_PATH`,
+  `/opt/bindiff/bin`, or `PATH`.
+
+### Changed
+
+- `gd import <bin> --program NAME` now actually imports under `NAME`
+  (previously the program always got the binary's file name and the CLI then
+  failed to open it).
+- Table/CSV/TSV output use the **union of keys across all rows** instead of
+  the first row's keys. Homogeneous row sets (the norm) are unchanged;
+  heterogeneous rows (e.g. diff `--unmatched`) no longer lose columns.
+
+### Fixed
+
+- `gd program delete` releases the target when it is the bridge's current
+  program (deleting an open program failed with "is in use") and reports a
+  close-first hint otherwise.
+- E2E tests no longer write into `$HOME`: test projects live under the system
+  temp dir (`GHIDRA_PROJECT_DIR` is pinned per test process). `Config` now
+  honors `GHIDRA_PROJECT_DIR` everywhere the default project dir is resolved.
+
+## [0.3.0]
+
+### Added
+
+- **Scale optimizations (P6):** server-side filter pushdown — an exact
+  `~`/`=` filter on a bridge field (`name`, `address`) is executed in the
+  bridge instead of fetching the full dataset (34k-symbol query: 2.7×
+  faster); server-side `--offset` (paged fetches are O(offset+limit), not
+  O(n)) with safety gating (never when a client-side filter/sort/count can
+  change membership or order).
+
+### Changed
+
+- Internal: the query pipeline (plan → fetch → filter → sort → limit →
+  count) now lives in one `QueryPlan`; command dispatch is split into
+  `src/cmd/` modules behind a `CommandMeta` trait; response unwrapping uses a
+  typed ENVELOPES table; the Java bridge has a command registry with a
+  central `requireProgram` guard and a `raw help` command; output formats are
+  snapshot-tested.
+
+### Fixed
+
+- Filter grammar: unquoted string values may now start with digits, dots, or
+  hyphens (`name~000`, `name^1.2`), and trailing garbage is rejected
+  (`name=test garbage` no longer silently parses as `name=test`).
+- Bridge imports now run deterministic analysis — programs imported over TCP
+  were previously left unanalyzed.
+- `diff programs`/`diff functions` honestly labeled as limited (pre-0.4.0 they
+  were not real cross-program diffs).
+
 ## [0.2.2]
 
 ### Added

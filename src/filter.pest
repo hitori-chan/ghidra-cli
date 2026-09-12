@@ -1,7 +1,7 @@
 WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
 
-// Main expression
-expr = { logical_expr }
+// Main expression (anchored: trailing junk is an error, not ignored)
+expr = { SOI ~ logical_expr ~ EOI }
 
 // Logical expressions
 logical_expr = { logical_term ~ (logical_op ~ logical_term)* }
@@ -29,7 +29,16 @@ identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 // Values
 value = { hex_number | number | boolean | quoted_string | identifier }
-string_value = { quoted_string | identifier }
+// String values may start with digits (addresses like `0003354c`, versions
+// like `1.2.3`): an unquoted string is any run of characters that cannot
+// start an operator, delimiter, or quoted value.
+string_value = { quoted_string | unquoted_string }
+unquoted_string = @{ (!special_char ~ ANY)+ }
+special_char = _{
+    " " | "\t" | "\n" | "\r"
+    | "~" | "^" | "$" | "=" | "!" | "<" | ">" | "("
+    | ")" | "[" | "]" | "," | "\"" | "'"
+}
 number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 hex_number = @{ "0x" ~ ASCII_HEX_DIGIT+ }
 boolean = { "true" | "false" | "TRUE" | "FALSE" }

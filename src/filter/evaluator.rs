@@ -167,7 +167,12 @@ fn scalar_to_lower_string(v: &JsonValue) -> Option<String> {
 /// recompiling on every row dominates runtime on large datasets.
 /// Case-insensitive because field values are lowercased before matching —
 /// an uppercase pattern like `^PK_` could otherwise never match.
-fn compiled_regex(pattern: &str) -> Result<std::rc::Rc<regex::Regex>> {
+///
+/// Also the plan-time validator: `Filter::validate` walks the parsed tree
+/// and calls this for every regex pattern, so an invalid pattern fails
+/// before any fetch instead of mid-evaluation (after a full dataset
+/// transfer).
+pub(crate) fn compiled_regex(pattern: &str) -> Result<std::rc::Rc<regex::Regex>> {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;

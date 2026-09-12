@@ -21,7 +21,23 @@ pub struct Config {
     /// Defaults to 180s when unset (must accommodate the first-run OSGi compile).
     #[serde(default)]
     pub launch_timeout_secs: Option<u64>,
-    pub aliases: std::collections::HashMap<String, String>,
+    /// Optional BinDiff (google/bindiff) integration for `gd diff programs`.
+    #[serde(default)]
+    pub bindiff: Option<BindiffConfig>,
+}
+
+/// BinDiff integration settings (`gd diff programs` requires a native
+/// `bindiff` differ and the plain `BinExport.jar` Ghidra exporter).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BindiffConfig {
+    /// Path to the native BinDiff differ binary (e.g.
+    /// `/opt/bindiff/bin/bindiff`). When unset, ghidra-cli searches
+    /// `$BINDIFF_PATH` (a directory), `/opt/bindiff/bin`, and `PATH` for a
+    /// `bindiff`/`differ` executable.
+    pub differ: Option<PathBuf>,
+    /// Plain (non-OSGi-bundle) `BinExport.jar` that the bridge loads at
+    /// runtime to export programs to BinExport.
+    pub binexport_jar: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -35,7 +51,7 @@ impl Default for Config {
             default_output_format: Some("auto".to_string()),
             default_limit: Some(1000),
             launch_timeout_secs: None,
-            aliases: std::collections::HashMap::new(),
+            bindiff: None,
         }
     }
 }
@@ -128,6 +144,13 @@ impl Config {
     /// components, so we keep the cache-dir location for them and only fall back to
     /// a non-hidden `~/ghidra-cli-projects` when the cache path has a dot element.
     pub fn default_project_dir() -> Result<PathBuf> {
+        // Explicit override (also how the test suite pins projects to a
+        // temp dir so tests never write into $HOME).
+        if let Ok(dir) = std::env::var("GHIDRA_PROJECT_DIR") {
+            if !dir.trim().is_empty() {
+                return Ok(PathBuf::from(dir));
+            }
+        }
         if let Some(cache_dir) = dirs::cache_dir() {
             let candidate = cache_dir.join("ghidra-cli").join("projects");
             if !has_hidden_component(&candidate) {
@@ -232,10 +255,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_timeout_is_ignored_and_not_reserialized() {
+    fn legacy_keys_are_ignored_and_not_reserialized() {
         let config: Config = serde_yaml::from_str("timeout: 1800\naliases: {}\n").unwrap();
         let serialized = serde_yaml::to_string(&config).unwrap();
         assert!(!serialized.contains("timeout:"), "{serialized}");
+        assert!(!serialized.contains("aliases:"), "{serialized}");
     }
 
     #[test]

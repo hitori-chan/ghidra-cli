@@ -3,6 +3,7 @@
 //! Connects directly to the Java GhidraCliBridge via TCP.
 //! No intermediate daemon process is needed.
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -118,7 +119,7 @@ fn connect_with_retry(addr: &std::net::SocketAddr) -> Result<TcpStream> {
                 let e = last_err.unwrap_or(e);
                 anyhow::bail!(
                     "Failed to connect to bridge on port {} after waiting {}s: {}. \
-                     Is the bridge running? Check `ghidra status`.",
+                     Is the bridge running? Check `gd status`.",
                     addr.port(),
                     budget.as_secs(),
                     e
@@ -131,18 +132,29 @@ fn connect_with_retry(addr: &std::net::SocketAddr) -> Result<TcpStream> {
 /// Client for communicating with the Ghidra Java bridge.
 pub struct BridgeClient {
     port: u16,
+    /// Name of the last command sent on this client — the envelope table
+    /// (`query::ENVELOPES`) keys off it to unwrap list responses.
+    last_command: RefCell<Option<String>>,
 }
 
 impl BridgeClient {
     /// Create a client for a known port.
     pub fn new(port: u16) -> Self {
-        Self { port }
+        Self {
+            port,
+            last_command: RefCell::new(None),
+        }
     }
 
     /// Get the port this client connects to.
     #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Name of the last command sent on this client, if any.
+    pub fn last_command(&self) -> Option<String> {
+        self.last_command.borrow().clone()
     }
 
     /// Send a command to the bridge and return the result.
@@ -169,6 +181,7 @@ impl BridgeClient {
         args: Option<serde_json::Value>,
         read_timeout: Option<Duration>,
     ) -> Result<serde_json::Value> {
+        *self.last_command.borrow_mut() = Some(command.to_string());
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", self.port)
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid address: {}", e))?;
@@ -195,7 +208,7 @@ impl BridgeClient {
             // EOF before any response: bridge closed the socket without replying.
             Ok(0) => anyhow::bail!(
                 "Bridge closed the connection without responding to '{}' \
-                 (it may have crashed or been restarted). Retry, or check `ghidra status`.",
+                 (it may have crashed or been restarted). Retry, or check `gd status`.",
                 command
             ),
             Ok(_) => {}
@@ -210,7 +223,7 @@ impl BridgeClient {
             {
                 anyhow::bail!(
                     "Bridge did not respond within {}s while running '{}' — the program job is \
-                     still queued or running. Inspect `ghidra jobs`, raise the wait via \
+                     still queued or running. Inspect `gd jobs`, raise the wait via \
                      GHIDRA_CLI_READ_TIMEOUT (seconds; 0 = wait indefinitely), or use \
                      GHIDRA_CLI_OP_TIMEOUT for long analyze/import operations.",
                     read_timeout.map(|d| d.as_secs()).unwrap_or(0),
@@ -280,6 +293,7 @@ impl BridgeClient {
         &self,
         limit: Option<usize>,
         filter: Option<String>,
+        offset: Option<usize>,
         tags: &[String],
         untagged: bool,
     ) -> Result<serde_json::Value> {
@@ -288,6 +302,7 @@ impl BridgeClient {
             Some(json!({
                 "limit": limit,
                 "filter": filter,
+                "offset": offset,
                 "tags": tags,
                 "untagged": untagged,
             })),
@@ -318,10 +333,15 @@ impl BridgeClient {
         &self,
         limit: Option<usize>,
         filter: Option<String>,
+        offset: Option<usize>,
     ) -> Result<serde_json::Value> {
         self.send_command(
             "list_strings",
-            Some(json!({"limit": limit, "filter": filter})),
+            Some(json!({
+                "limit": limit,
+                "filter": filter,
+                "offset": offset,
+            })),
         )
     }
 
@@ -391,10 +411,15 @@ impl BridgeClient {
         &self,
         limit: Option<usize>,
         filter: Option<&str>,
+        offset: Option<usize>,
     ) -> Result<serde_json::Value> {
         self.send_command(
             "symbol_list",
-            Some(json!({"limit": limit, "filter": filter})),
+            Some(json!({
+                "limit": limit,
+                "filter": filter,
+                "offset": offset,
+            })),
         )
     }
 
@@ -424,8 +449,16 @@ impl BridgeClient {
         &self,
         limit: Option<usize>,
         filter: Option<&str>,
+        offset: Option<usize>,
     ) -> Result<serde_json::Value> {
-        self.send_command("type_list", Some(json!({"limit": limit, "filter": filter})))
+        self.send_command(
+            "type_list",
+            Some(json!({
+                "limit": limit,
+                "filter": filter,
+                "offset": offset,
+            })),
+        )
     }
 
     /// List function tags (all tags, or one function's tags).
@@ -464,10 +497,15 @@ impl BridgeClient {
         &self,
         limit: Option<usize>,
         filter: Option<&str>,
+        offset: Option<usize>,
     ) -> Result<serde_json::Value> {
         self.send_command(
             "comment_list",
-            Some(json!({"limit": limit, "filter": filter})),
+            Some(json!({
+                "limit": limit,
+                "filter": filter,
+                "offset": offset,
+            })),
         )
     }
 
@@ -533,6 +571,56 @@ impl BridgeClient {
         self.send_command("find_calls", Some(json!({"function": function})))
     }
 
+    /// Find instructions whose disassembly text matches a pattern.
+    /// Matches instruction text directly, so it works even where Ghidra
+    /// failed to create cross-references (under-analyzed programs).
+    pub fn find_instruction(
+        &self,
+        pattern: &str,
+        limit: usize,
+        start: Option<&str>,
+        end: Option<&str>,
+        case_sensitive: bool,
+    ) -> Result<serde_json::Value> {
+        let mut args = json!({"pattern": pattern, "limit": limit});
+        if let Some(s) = start {
+            args["start"] = json!(s);
+        }
+        if let Some(e) = end {
+            args["end"] = json!(e);
+        }
+        if case_sensitive {
+            args["case_insensitive"] = json!(false);
+        }
+        self.send_command("find_instruction", Some(args))
+    }
+
+    /// Find little-endian byte occurrences of a constant, plus ARM LDR
+    /// literal-pool references into each hit (bridge-side scan).
+    pub fn find_constant(
+        &self,
+        value: &str,
+        size: usize,
+        max: usize,
+        refs: bool,
+    ) -> Result<serde_json::Value> {
+        self.send_command(
+            "find_constant",
+            Some(json!({"value": value, "size": size, "max": max, "refs": refs})),
+        )
+    }
+
+    /// Decompile multiple addresses in one round trip. Blocks until the bridge
+    /// finishes: batch duration is unbounded (like `decompile`), so no fixed
+    /// read timeout is applied.
+    pub fn decompile_multi(&self, addresses: &[String]) -> Result<serde_json::Value> {
+        self.send_command_with_timeout(
+            "decompile_multi",
+            Some(json!({"addresses": addresses})),
+            None,
+        )
+    }
+
     pub fn find_crypto(&self) -> Result<serde_json::Value> {
         self.send_command("find_crypto", None)
     }
@@ -541,10 +629,23 @@ impl BridgeClient {
         self.send_command("find_interesting", None)
     }
 
-    pub fn diff_programs(&self, program1: &str, program2: &str) -> Result<serde_json::Value> {
-        self.send_command(
+    /// BinDiff prep: the bridge exports both programs to `.BinExport`.
+    /// Long operation (exporting large programs can take minutes) — no
+    /// default read timeout.
+    pub fn diff_programs(
+        &self,
+        program1: Option<&str>,
+        program2: &str,
+        binexport_jar: &str,
+    ) -> Result<serde_json::Value> {
+        self.send_command_with_timeout(
             "diff_programs",
-            Some(json!({"program1": program1, "program2": program2})),
+            Some(json!({
+                "program1": program1,
+                "program2": program2,
+                "binexport_jar": binexport_jar,
+            })),
+            long_op_timeout(),
         )
     }
 
@@ -574,11 +675,17 @@ impl BridgeClient {
         &self,
         address: &str,
         num_instructions: Option<usize>,
+        end: Option<&str>,
+        resolve: bool,
     ) -> Result<serde_json::Value> {
-        self.send_command(
-            "disasm",
-            Some(json!({"address": address, "count": num_instructions})),
-        )
+        let mut args = json!({"address": address, "resolve": resolve});
+        if let Some(n) = num_instructions {
+            args["count"] = json!(n);
+        }
+        if let Some(e) = end {
+            args["end"] = json!(e);
+        }
+        self.send_command("disasm", Some(args))
     }
 
     pub fn stats(&self) -> Result<serde_json::Value> {

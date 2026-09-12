@@ -191,7 +191,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run read-only integration tests
-        run: cargo test --test readonly_tests --test command_tests --verbose -- --nocapture
+        run: cargo test --test readonly_functions --test readonly_strings_xrefs --test readonly_graphs --test command_tests --verbose -- --nocapture
         timeout-minutes: 80
         env:
           RUST_LOG: info

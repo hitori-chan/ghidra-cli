@@ -82,6 +82,7 @@ impl Value {
     }
 }
 
+#[derive(Debug)]
 pub struct Filter {
     pub expr: FilterExpr,
 }
@@ -91,8 +92,36 @@ impl Filter {
         parser::parse_filter(input)
     }
 
+    /// Plan-time validation: pre-compile every regex pattern in the tree so
+    /// an invalid pattern fails before any data fetch (the lazy per-row
+    /// compile would otherwise surface the error mid-pipeline, after the
+    /// full dataset was already transferred).
+    pub fn validate(&self) -> Result<()> {
+        self.expr.validate()
+    }
+
     pub fn evaluate(&self, data: &serde_json::Value) -> Result<bool> {
         evaluator::evaluate(&self.expr, data)
+    }
+}
+
+impl FilterExpr {
+    /// Validate every regex pattern in the tree (recurses into logical
+    /// groups and negations).
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            FilterExpr::StringOp {
+                op: StringOp::Regex,
+                value,
+                ..
+            } => {
+                evaluator::compiled_regex(value)?;
+                Ok(())
+            }
+            FilterExpr::Logical { exprs, .. } => exprs.iter().try_for_each(|e| e.validate()),
+            FilterExpr::Not(inner) => inner.validate(),
+            _ => Ok(()),
+        }
     }
 }
 

@@ -12,8 +12,12 @@ A Rust CLI for automating Ghidra reverse engineering tasks. Usable directly by h
 - **Function signatures** - Edit return types, calling conventions, full C signatures; retype variables
 - **Binary patching** - Modify bytes, NOP instructions, export patches
 - **Call graphs** - Generate caller/callee graphs, export to DOT format
-- **Search capabilities** - Find strings, bytes, functions, crypto patterns
-- **Script execution** - Run Java/Python Ghidra scripts, inline or from files
+- **Search capabilities** - Find strings, bytes, functions, constant values (with ARM LDR literal-pool refs), instruction text patterns (works without xrefs), crypto patterns
+- **Raw C/assembly output** - `decompile` and `disasm` print raw C / raw assembly by default (override with `--json`, `--pretty`, or `-o`)
+- **Raw bridge access** - `gd raw <command> [JSON]` reaches every bridge command, including memory reads and range queries
+- **Session context** - `GD_PROJECT`/`GD_PROGRAM` environment variables as project/program fallbacks
+- **Program diffing** - `gd diff programs` is a real function-level cross-program diff via [Google binDiff](https://github.com/google/bindiff) (per-function similarity/confidence, `--changed`, `--unmatched`) — requires the binDiff toolchain, see [Diff (BinDiff)](#diff-bindiff)
+- **Script execution** - Run checked-in Java Ghidra scripts with real positional args and `--expect` artifact gates
 - **Batch operations** - Execute multiple commands from a file
 - **Responsive job control** - Long analyses run on a serialized program lane while `ping`, `status`, `jobs`, and `cancel` stay live on a separate control plane
 - **Flexible output** - Human-readable, JSON, or pretty JSON formats
@@ -24,7 +28,7 @@ A Rust CLI for automating Ghidra reverse engineering tasks. Usable directly by h
 ```
 ┌─────────────────┐         ┌──────────────────────────────────────┐
 │   CLI Command   │──TCP──▶ │  GhidraCliBridge.java                │
-│   ghidra ...    │         │  (GhidraScript in analyzeHeadless)   │
+│   gd ...    │         │  (GhidraScript in analyzeHeadless)   │
 │   --project X   │         │  ServerSocket on localhost:dynamic   │
 └─────────────────┘         └──────────────────────────────────────┘
 ```
@@ -38,25 +42,28 @@ Each project gets its own bridge process and port file, so you can analyze sever
 ### From Source
 
 ```bash
-git clone https://github.com/akiselev/ghidra-cli
+git clone https://github.com/hitori-chan/ghidra-cli
 cd ghidra-cli
 cargo install --path .
 ```
 
+The binary is named **`gd`** — a short, distinct name that never shadows the
+native Ghidra commands (`ghidra`, `analyzeHeadless`, ...) on `PATH`.
+
 ### Requirements
 
-- **Ghidra 11+** - Download from [ghidra-sre.org](https://ghidra-sre.org), or run `ghidra setup` to fetch it
-- **A full JDK** - not a JRE. Ghidra compiles the bridge script at runtime, so it needs `javac` and the `jdk.compiler` module. Ghidra 12.x wants JDK 21; older releases accept JDK 17. `ghidra doctor` finds a suitable JDK and compiles the bridge as a health check.
+- **Ghidra 12.x** (12.1.2 verified) - Download from [ghidra-sre.org](https://ghidra-sre.org), or run `gd setup` to fetch it
+- **A full JDK** - not a JRE. Ghidra compiles the bridge script at runtime, so it needs `javac` and the `jdk.compiler` module. Ghidra 12.x wants JDK 21; older releases accept JDK 17. `gd doctor` finds a suitable JDK and compiles the bridge as a health check.
 - **Rust 1.70+** - For building from source
 
-Point the CLI at your Ghidra install (skip this if you used `ghidra setup`):
+Point the CLI at your Ghidra install (skip this if you used `gd setup`):
 ```bash
 export GHIDRA_INSTALL_DIR=/path/to/ghidra
 # Or store it in config:
-ghidra config set ghidra_install_dir /path/to/ghidra
+gd config set ghidra_install_dir /path/to/ghidra
 ```
 
-`ghidra-cli` picks the JDK itself and passes it to Ghidra, so you don't have to
+`gd` picks the JDK itself and passes it to Ghidra, so you don't have to
 juggle `PATH`. Override the choice with the global `--java-home` flag, the
 `java_home` config key, or `GHIDRA_CLI_JAVA_HOME`.
 
@@ -64,25 +71,25 @@ juggle `PATH`. Override the choice with the global `--java-home` flag, the
 
 ```bash
 # Check installation
-ghidra doctor
+gd doctor
 
 # Import a binary. This starts the bridge and runs auto-analysis in one step.
-ghidra import ./binary --project myproject --program mybinary
+gd import ./binary --project myproject --program mybinary
 
 # Query functions (uses the running bridge)
-ghidra function list
+gd function list
 
 # Decompile a function
-ghidra decompile main
+gd decompile main
 
 # Find interesting strings
-ghidra find string "password"
+gd find string "password"
 
 # Get cross-references
-ghidra x-ref to 0x401000
+gd x-ref to 0x401000
 
 # Generate call graph
-ghidra graph callers main --depth 3
+gd graph callers main --depth 3
 ```
 
 ## Global Flags
@@ -90,7 +97,7 @@ ghidra graph callers main --depth 3
 These work before any subcommand, so you can set them once for a whole invocation:
 
 ```bash
-ghidra --project P --program bin function list   # --project/--program are global
+gd --project P --program bin function list   # --project/--program are global
 ```
 
 | Flag | Effect |
@@ -112,27 +119,50 @@ Ghidra 12.1+ rejects project directories that contain a dot-prefixed component
 
 ### Project & Program Management
 ```bash
-ghidra project create <name>           # Create project
-ghidra project list                    # List projects
-ghidra project info [<name>]           # Show project info
-ghidra project delete <name>           # Delete project (removes .gpr/.rep, stops its bridge)
-ghidra import <binary> --project <p>   # Import + auto-analyze (bridge auto-starts)
-ghidra import <binary> --no-analyze    # Import only, skip analysis (still persisted)
-ghidra import <binary> --detach        # Return immediately; bridge keeps importing
-ghidra analyze --project <p>           # (Re)run analysis on an imported program
+gd project create <name>           # Create project
+gd project list                    # List projects
+gd project info [<name>]           # Show project info
+gd project delete <name>           # Delete project (removes .gpr/.rep, stops its bridge)
+gd import <binary> --project <p>   # Import + auto-analyze (bridge auto-starts)
+gd import <binary> --no-analyze    # Import only, skip analysis (still persisted)
+gd import <binary> --detach        # Return immediately; bridge keeps importing
+gd import <binary> --program NAME  # Import under an explicit program name
+gd analyze --project <p>           # (Re)run analysis on an imported program
+gd program list                    # Programs in the project
+gd program info                    # Metadata for the current program (image base, memory, counts)
+gd program open --program NAME     # Switch to a program (close/delete take --program too)
+gd program export FORMAT -o OUT    # Export current program (binary, c/cpp, xml, json, …)
+gd rename OLD NEW                  # Rename a symbol (shortcut for symbol rename)
 ```
+
+### Generic Query & Dump
+
+```bash
+gd query functions --filter "name~evp" --count     # any data type, full filter DSL
+gd query strings --fields value,length --sort length --limit 20
+gd dump imports|exports|functions|strings          # flat dumps with the same options
+```
+
+`query`/`dump` take the standard query options (`--filter`, `--fields`,
+`--sort`, `--limit`, `--offset`, `--count`). A `--filter` on a list field is
+executed in the bridge (exact match on `~`/`=`, superset on `^`/`$`), and
+`--offset` pages server-side — the client always re-runs the pipeline, so
+results are identical to the pre-pushdown fetch.
 
 ### Function Analysis
 ```bash
-ghidra function list                   # List all functions
-ghidra function list --filter "size > 100"  # Filter by size
-ghidra decompile <name-or-addr>        # Decompile function
-ghidra decompile main --with-vars --with-params  # Include variable/param details
-ghidra disasm <address> --instructions 20  # Disassemble instructions
-ghidra function set-signature <func> --signature "int foo(int x, char *y)"
-ghidra function set-return-type <func> --type void
-ghidra function set-calling-convention <func> --convention __cdecl
-ghidra function set-var-type <func> --var local_10 --type "MyStruct *"
+gd function list                   # List all functions
+gd function list --filter "size > 100"  # Filter by size
+gd decompile <name-or-addr>        # Decompile function (prints raw C)
+gd decompile main --with-vars --with-params  # Include variable/param details
+gd decompile-multi a b c           # Decompile several in one round trip
+gd disasm <address> --instructions 20  # Disassemble (prints raw assembly)
+gd disasm <address> --end <addr>   # Disassemble a range until <addr>
+gd disasm <address> --no-resolve   # Skip literal-pool value resolution
+gd function set-signature <func> --signature "int foo(int x, char *y)"
+gd function set-return-type <func> --type void
+gd function set-calling-convention <func> --convention __cdecl
+gd function set-var-type <func> --var local_10 --type "MyStruct *"
 ```
 
 Decompilation has no native time limit by default, so large valid functions are
@@ -143,32 +173,32 @@ which is also unbounded by default.
 
 ### Symbols & Types
 ```bash
-ghidra symbol list                     # List symbols
-ghidra symbol create <addr> <name>     # Create symbol
-ghidra symbol rename <old> <new>       # Rename symbol
-ghidra type list                       # List data types (with kind: struct/enum/typedef/...)
-ghidra type get <name>                 # Get type details (fields, enum members, typedef base)
-ghidra type create <name>              # Create empty struct
-ghidra type add-field <struct> --name fd --type int   # Add struct field
-ghidra type del-field <struct> --name fd              # Remove struct field
-ghidra type create-enum <name> --values "A=0,B=1"     # Create enum
-ghidra type typedef <name> <base_type>                # Create typedef alias
-ghidra type rename <old> <new>         # Rename type
-ghidra type delete <name>              # Delete type
+gd symbol list                     # List symbols
+gd symbol create <addr> <name>     # Create symbol
+gd symbol rename <old> <new>       # Rename symbol
+gd type list                       # List data types (with kind: struct/enum/typedef/...)
+gd type get <name>                 # Get type details (fields, enum members, typedef base)
+gd type create <name>              # Create empty struct
+gd type add-field <struct> --name fd --type int   # Add struct field
+gd type del-field <struct> --name fd              # Remove struct field
+gd type create-enum <name> --values "A=0,B=1"     # Create enum
+gd type typedef <name> <base_type>                # Create typedef alias
+gd type rename <old> <new>         # Rename type
+gd type delete <name>              # Delete type
 ```
 
 ### Function Tags
 ```bash
-ghidra tag list                        # All tags (name, comment, use count)
-ghidra tag get <name>                  # Functions carrying a tag
-ghidra tag create <name> --comment "…" # Create a tag (comment optional)
-ghidra tag add <func> <tag>...         # Attach tags (auto-creates missing ones)
-ghidra tag remove <func> <tag>...      # Detach tags (--all clears every tag)
-ghidra tag rename <old> <new>          # Rename everywhere it is used
-ghidra tag set-comment <name> "…"      # Set/clear a tag's comment
-ghidra tag delete <name>               # Delete tag, detaching from all functions
-ghidra function list --tag <name>      # Filter by tag (repeatable = AND)
-ghidra function list --untagged        # Functions with no tags
+gd tag list                        # All tags (name, comment, use count)
+gd tag get <name>                  # Functions carrying a tag
+gd tag create <name> --comment "…" # Create a tag (comment optional)
+gd tag add <func> <tag>...         # Attach tags (auto-creates missing ones)
+gd tag remove <func> <tag>...      # Detach tags (--all clears every tag)
+gd tag rename <old> <new>          # Rename everywhere it is used
+gd tag set-comment <name> "…"      # Set/clear a tag's comment
+gd tag delete <name>               # Delete tag, detaching from all functions
+gd function list --tag <name>      # Filter by tag (repeatable = AND)
+gd function list --untagged        # Functions with no tags
 ```
 
 Tag names are case-sensitive. `tag add`/`remove` are idempotent (already-present
@@ -178,72 +208,123 @@ work too.
 
 ### Cross-References
 ```bash
-ghidra x-ref to <address>              # References TO address
-ghidra x-ref from <address>            # References FROM address
+gd x-ref to <address>              # References TO address
+gd x-ref from <address>            # References FROM address
 ```
 
 ### Search
 ```bash
-ghidra find string "pattern"           # Find strings
-ghidra find bytes "90 90 90"           # Find byte patterns
-ghidra find function "*crypt*"         # Find functions by name
-ghidra find crypto                     # Find crypto constants
-ghidra find interesting                # Find interesting patterns
+gd find string "pattern"           # Find strings
+gd find bytes "90 90 90"           # Find byte patterns
+gd find function "*crypt*"         # Find functions by name
+gd find constant 0xdeadbeef        # Find constant value (+ ARM LDR pool refs)
+gd find constant 0x8031 --size 4 --max 100
+gd find instruction "bl srand"     # Find instructions by disasm text (case-insensitive; --case-sensitive to disable)
+gd find instruction "ldr r4, [pc" --start 0x1000 --end 0x9000 --limit 50
+gd find crypto                     # Find crypto constants
+gd find interesting                # Find interesting patterns
 ```
+
+`find instruction` matches the instruction's disassembly text directly, so it
+works even where Ghidra failed to create cross-references (under-analyzed
+programs) — e.g. locating `bl srand` callers when `xref to srand` comes back
+empty. `find constant` scans for little-endian byte patterns and, for ARM, the
+literal-pool LDR loads into each hit.
+
+### Raw Bridge Commands
+
+```bash
+gd raw <command> [JSON]           # Send any bridge command
+gd raw ping                       # (default payload {})
+gd raw read_memory '{"address":"0x34f50","size":64}'
+gd raw functions_range '{"start":"0x137c8","end":"0x7be8b"}'
+gd raw defined_data '{"start":"0x34f40","end":"0x34f80"}'
+```
+
+`raw` is the escape hatch: every bridge command (see the `case` list in
+`src/ghidra/scripts/GhidraCliBridge.java`) is reachable even before a
+dedicated subcommand exists. `--project`/`--program` work as usual.
 
 ### Call Graphs
 ```bash
-ghidra graph calls                     # Full call graph
-ghidra graph callers <func>            # Who calls this? (--depth optional)
-ghidra graph callees <func>            # What does this call? (--depth optional)
-ghidra graph export dot                # Export to DOT format
+gd graph calls                     # Full call graph
+gd graph callers <func>            # Who calls this? (--depth optional)
+gd graph callees <func>            # What does this call? (--depth optional)
+gd graph export dot                # Export to DOT format
 ```
 
 ### Binary Patching
 ```bash
-ghidra patch bytes <addr> "90 90"      # Patch bytes
-ghidra patch nop <addr> --count 5      # NOP out instructions
-ghidra patch export -o patched.bin     # Export patched binary
+gd patch bytes <addr> "90 90"      # Patch bytes
+gd patch nop <addr> --count 5      # NOP out instructions
+gd patch export -o patched.bin     # Export patched binary
 ```
 
 `patch nop --count N` NOPs N consecutive instructions starting at the address
 (default 1), walking instruction by instruction so variable-length ISAs work. If
 any address in the run has no instruction, the whole patch rolls back untouched.
 
+### Diff (BinDiff)
+```bash
+gd diff programs OLD NEW            # function-level diff via Google BinDiff
+gd diff programs OLD NEW --changed  # only non-identical matches
+gd diff programs OLD NEW --unmatched
+gd diff programs OLD NEW --min-sim 0.9 --name main
+gd diff functions FUNC1 FUNC2       # naive line-by-line C diff, same program only
+```
+
+`diff programs` compares two programs in the project with the [BinDiff](https://github.com/google/bindiff)
+engine: the bridge exports both programs to BinExport, the native differ
+matches functions, and the CLI reads back the `.BinDiff` database. It requires
+two optional third-party pieces (the command fails with setup instructions if
+either is missing):
+
+- a native **BinDiff** differ — set `bindiff.differ` in config, or install it
+  under `$BINDIFF_PATH` / `/opt/bindiff/bin` / `PATH`;
+- the plain (non-OSGi) **BinExport.jar** — `gd config set bindiff.binexport_jar /path/to/BinExport.jar`.
+
+Rows carry `similarity`/`confidence` (3 decimals; 1.0 = identical) plus
+addresses and names for both sides. Note that binDiff normalizes immediate
+constants, so constant-only edits still read as identical — structural edits
+(ops, control flow, signatures) are what drop similarity.
+
 ### Comments
 ```bash
-ghidra comment get <address>           # Get comment
-ghidra comment set <addr> "note" --comment-type EOL  # Set comment
-ghidra comment list                    # List all comments
+gd comment get <address>           # Get comment
+gd comment set <addr> "note" --comment-type EOL  # Set comment
+gd comment list                    # List all comments
 ```
 
 `--comment-type` accepts `EOL` (default), `PRE`, `POST`, or `PLATE`.
 
 ### Scripts
 ```bash
-ghidra script list                     # List available scripts
-ghidra script run myscript.py          # Run a script file
-ghidra script run report.py -- arg1 arg2   # Pass positional args after --
-ghidra script run dump.py --expect out.csv:10   # Fail unless out.csv has >=10 rows
-ghidra script python "print(currentProgram)"   # Inline Python
-ghidra script java "println(currentProgram);"   # Inline Java
+gd script list                     # List available scripts
+gd script run myscript.java        # Run a script file (absolute path, no copy)
+gd script run report.java -- arg1 arg2      # Pass positional args after --
+gd script run dump.java --expect out.csv:10 # Fail unless out.csv has >=10 rows
 ```
 
 `script run` resolves the path to an absolute location, forwards the args after
 `--` to the script, and captures its stdout in the response. Use `--expect
 PATH[:MIN_ROWS]` (repeatable) to make the job fail when an output artifact is
 missing, empty, or short, and `--allow-empty` to permit an expected-but-empty
-file.
+file. Scripts run on the cancellable job lane (`gd cancel` works).
+
+**Java scripts must be class-form**: a `public class X extends GhidraScript`
+whose class name matches the file name — body-only snippets fail with a
+misleading "class could not be found" compile error. Inline `script java` /
+`script python` are not supported in the bridge and return a clean error.
 
 ### Batch Operations
 ```bash
-ghidra batch commands.txt              # Run commands from file
+gd batch commands.txt              # Run commands from file
 ```
 
 ### Statistics
 ```bash
-ghidra stats                           # Program statistics
-ghidra summary                         # Program summary
+gd stats                           # Program statistics
+gd summary                         # Program summary
 ```
 
 ## Bridge Management
@@ -252,28 +333,28 @@ The bridge keeps Ghidra loaded in memory. It starts automatically when needed, b
 
 ```bash
 # Start bridge with a program loaded
-ghidra start --project myproject --program mybinary
+gd start --project myproject --program mybinary
 
 # Check bridge status
-ghidra status --project myproject
+gd status --project myproject
 
 # Inspect active, queued, and recent jobs (or one job by ID)
-ghidra jobs --project myproject
-ghidra jobs 42 --project myproject
+gd jobs --project myproject
+gd jobs 42 --project myproject
 
 # Cooperatively cancel the active job, or select a queued/running job by ID
-ghidra cancel --project myproject
-ghidra cancel 42 --project myproject
+gd cancel --project myproject
+gd cancel 42 --project myproject
 
 # All commands use the bridge automatically
-ghidra function list --project myproject    # Fast!
-ghidra decompile main --project myproject   # Fast!
+gd function list --project myproject    # Fast!
+gd decompile main --project myproject   # Fast!
 
 # Stop bridge
-ghidra stop --project myproject
+gd stop --project myproject
 
 # Restart with different program
-ghidra restart --project myproject --program otherbinary
+gd restart --project myproject --program otherbinary
 ```
 
 The bridge handles networking and lifecycle controls independently from Ghidra
@@ -289,14 +370,14 @@ Each project gets its own bridge process and port file, allowing concurrent anal
 
 ```bash
 # Work on multiple projects simultaneously
-ghidra import ./binary_a --project projA
-ghidra analyze --project projA --program binary_a
-ghidra import ./binary_b --project projB
-ghidra analyze --project projB --program binary_b
+gd import ./binary_a --project projA
+gd analyze --project projA --program binary_a
+gd import ./binary_b --project projB
+gd analyze --project projB --program binary_b
 
 # Query each independently
-ghidra function list --project projA
-ghidra function list --project projB
+gd function list --project projA
+gd function list --project projB
 ```
 
 ## Output Formats
@@ -311,13 +392,13 @@ Default output is human-readable when connected to a terminal. When piped (non-T
 Override with flags:
 ```bash
 # Force JSON output (compact, single-line)
-ghidra function list --json
+gd function list --json
 
 # Force pretty JSON (indented, multi-line)
-ghidra function list --pretty
+gd function list --pretty
 
 # Select specific fields
-ghidra function list --fields "name,address,size"
+gd function list --fields "name,address,size"
 ```
 
 ### Output Format Design
@@ -329,9 +410,9 @@ The bridge always emits compact JSON over the socket. The CLI decides the human-
 Use expressions to filter results:
 
 ```bash
-ghidra function list --filter "size > 100"
-ghidra function list --filter "name ~ 'main'"
-ghidra strings list --filter "length > 20"
+gd function list --filter "size > 100"
+gd function list --filter "name ~ 'main'"
+gd strings list --filter "length > 20"
 ```
 
 ## Environment Variables
@@ -344,8 +425,20 @@ Paths and defaults:
 | `GHIDRA_PROJECT_DIR` | Base directory for projects |
 | `GHIDRA_CLI_JAVA_HOME` | Full JDK for Ghidra (overrides auto-detection) |
 | `GHIDRA_CLI_CONFIG` | Override the config file path |
-| `GHIDRA_DEFAULT_PROJECT` | Default `--project` for `ghidra query` |
-| `GHIDRA_DEFAULT_PROGRAM` | Default `--program` for `ghidra query` and auto-selection |
+| `GHIDRA_DEFAULT_PROJECT` | Default `--project` for `gd query` |
+| `GHIDRA_DEFAULT_PROGRAM` | Default `--program` for `gd query` and auto-selection |
+| `GD_PROJECT` | Session-level `--project` fallback (command flag > global flag > env) |
+| `GD_PROGRAM` | Session-level `--program` fallback (command flag > global flag > env) |
+
+`GD_PROJECT`/`GD_PROGRAM` exist for agent and shell workflows that repeatedly
+query one project/program — export them once instead of repeating the flags:
+
+```bash
+export GD_PROJECT=tmp-ws50 GD_PROGRAM=webService
+gd decompile 0x34db8        # no flags needed
+gd find instruction "bl srand"
+```
+
 
 Timeouts. Most default to unbounded so that a legitimately long analysis or
 decompile isn't cut off. Set them when you'd rather fail fast:
@@ -362,12 +455,12 @@ decompile isn't cut off. Set them when you'd rather fail fast:
 ## AI Agent Integration
 
 Output is structured JSON and the command set is broad, so an agent can script a full reverse-engineering pass end to end. A representative workflow:
-1. `ghidra import suspicious.exe --project analysis` - Import, auto-analyze, and start the bridge in one step
-2. `ghidra find interesting` - AI analyzes suspicious patterns
-3. `ghidra decompile <func>` - AI examines specific functions
-4. `ghidra x-ref to <addr>` - AI traces data flow
-5. `ghidra patch nop <addr>` - AI patches anti-debug code
-6. `ghidra patch export -o patched.bin` - Export patched binary
+1. `gd import suspicious.exe --project analysis` - Import, auto-analyze, and start the bridge in one step
+2. `gd find interesting` - AI analyzes suspicious patterns
+3. `gd decompile <func>` - AI examines specific functions
+4. `gd x-ref to <addr>` - AI traces data flow
+5. `gd patch nop <addr>` - AI patches anti-debug code
+6. `gd patch export -o patched.bin` - Export patched binary
 
 ## Troubleshooting
 
@@ -416,7 +509,7 @@ WSL requires X11 libraries even for headless operation because Java AWT is loade
 Use the doctor command to verify your installation:
 
 ```bash
-ghidra doctor
+gd doctor
 ```
 
 This checks:

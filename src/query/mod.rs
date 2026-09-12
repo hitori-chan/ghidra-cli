@@ -1,297 +1,13 @@
-use crate::cli::QueryOptions;
-use crate::error::{GhidraError, Result};
-use crate::filter::Filter;
-use crate::format::{DefaultFormatter, Formatter, OutputFormat};
+//! Query processing: field/sort selection and bridge-response unwrapping.
+//! Fetch-vs-post planning lives in [`planner`].
+
+mod planner;
+
+pub use planner::QueryPlan;
+
 use serde_json::Value as JsonValue;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum DataType {
-    Functions,
-    Strings,
-    Symbols,
-    Imports,
-    Exports,
-    XRefs,
-    Memory,
-    Sections,
-    Comments,
-    Types,
-    Instructions,
-    BasicBlocks,
-    CallGraph,
-    Data,
-    References,
-}
-
-#[allow(dead_code)]
-impl DataType {
-    pub fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "functions" | "function" | "fn" => Ok(Self::Functions),
-            "strings" | "string" | "str" => Ok(Self::Strings),
-            "symbols" | "symbol" | "sym" => Ok(Self::Symbols),
-            "imports" | "import" => Ok(Self::Imports),
-            "exports" | "export" => Ok(Self::Exports),
-            "xrefs" | "xref" | "crossrefs" => Ok(Self::XRefs),
-            "memory" | "mem" => Ok(Self::Memory),
-            "sections" | "section" => Ok(Self::Sections),
-            "comments" | "comment" => Ok(Self::Comments),
-            "types" | "type" => Ok(Self::Types),
-            "instructions" | "instruction" | "insn" => Ok(Self::Instructions),
-            "basicblocks" | "basic-blocks" | "blocks" => Ok(Self::BasicBlocks),
-            "callgraph" | "call-graph" => Ok(Self::CallGraph),
-            "data" => Ok(Self::Data),
-            "references" | "refs" => Ok(Self::References),
-            _ => Err(GhidraError::InvalidDataType(format!(
-                "Unknown data type: {}",
-                s
-            ))),
-        }
-    }
-}
-
-pub struct Query {
-    #[allow(dead_code)]
-    pub data_type: DataType,
-    pub filter: Option<Filter>,
-    pub fields: Option<FieldSelector>,
-    pub format: OutputFormat,
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
-    pub sort: Option<Vec<SortKey>>,
-    pub count_only: bool,
-}
-
-impl Query {
-    #[allow(dead_code)]
-    pub fn new(data_type: DataType) -> Self {
-        Self {
-            data_type,
-            filter: None,
-            fields: None,
-            format: OutputFormat::Json,
-            limit: None,
-            offset: None,
-            sort: None,
-            count_only: false,
-        }
-    }
-
-    /// Build a Query from CLI QueryOptions. Returns None if no query processing is needed.
-    pub fn from_options(opts: &QueryOptions, format: OutputFormat) -> Result<Option<Self>> {
-        let has_filter = opts.filter.is_some();
-        let has_fields = opts.fields.is_some();
-        let has_sort = opts.sort.is_some();
-        let has_count = opts.count;
-        let has_offset = opts.offset.is_some();
-        let has_limit = opts.limit.is_some();
-
-        // No query processing needed if no filter/fields/sort/count/offset/limit.
-        // Offset and limit must be handled here because some bridge list handlers
-        // (e.g. imports/exports) never paginate — when either is set,
-        // `bridge_list_params` (main.rs) may fetch the full dataset and this Query
-        // must apply the real offset/limit itself. Applying the limit again on a
-        // dataset the bridge already capped is idempotent, so this is safe.
-        if !has_filter && !has_fields && !has_sort && !has_count && !has_offset && !has_limit {
-            return Ok(None);
-        }
-
-        let filter = opts.filter.as_ref().map(|f| Filter::parse(f)).transpose()?;
-        let fields = opts
-            .fields
-            .as_ref()
-            .map(|f| FieldSelector::parse(f))
-            .transpose()?;
-        let sort = opts.sort.as_ref().map(|s| SortKey::parse(s));
-
-        Ok(Some(Self {
-            data_type: DataType::Functions, // placeholder, not used in process_results
-            filter,
-            fields,
-            format,
-            // The bridge only skips limit/filter when filter/sort/count/offset is
-            // requested (see `bridge_list_params` in main.rs) — in that case it
-            // returns the full dataset and we must paginate here ourselves.
-            limit: opts.limit,
-            offset: opts.offset,
-            sort,
-            count_only: has_count,
-        }))
-    }
-
-    #[allow(dead_code)]
-    pub fn with_filter(mut self, filter: Filter) -> Self {
-        self.filter = Some(filter);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_format(mut self, format: OutputFormat) -> Self {
-        self.format = format;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_limit(mut self, limit: usize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_offset(mut self, offset: usize) -> Self {
-        self.offset = Some(offset);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn count_only(mut self) -> Self {
-        self.count_only = true;
-        self
-    }
-
-    /// Process query results from pre-fetched data.
-    ///
-    /// Note: Data fetching is now handled by the daemon via IPC.
-    /// This method only handles filtering, field selection, sorting, and formatting.
-    pub fn process_results(&self, data: Vec<JsonValue>) -> Result<String> {
-        // Apply filter
-        let filtered = if let Some(filter) = &self.filter {
-            self.apply_filter(&data, filter)?
-        } else {
-            data
-        };
-
-        // Apply field selection
-        let selected = if let Some(fields) = &self.fields {
-            self.select_fields(&filtered, fields)?
-        } else {
-            filtered
-        };
-
-        // Apply sorting
-        let sorted = if let Some(sort) = &self.sort {
-            self.apply_sort(&selected, sort)?
-        } else {
-            selected
-        };
-
-        // Apply pagination
-        let paginated = self.apply_pagination(&sorted);
-
-        // Return count if requested
-        if self.count_only {
-            return Ok(paginated.len().to_string());
-        }
-
-        // Format output
-        let formatter = DefaultFormatter;
-        formatter.format(&paginated, self.format)
-    }
-
-    fn apply_filter(&self, data: &[JsonValue], filter: &Filter) -> Result<Vec<JsonValue>> {
-        let mut result = Vec::new();
-
-        for item in data {
-            if filter.evaluate(item)? {
-                result.push(item.clone());
-            }
-        }
-
-        Ok(result)
-    }
-
-    fn select_fields(
-        &self,
-        data: &[JsonValue],
-        selector: &FieldSelector,
-    ) -> Result<Vec<JsonValue>> {
-        let mut result = Vec::new();
-
-        for item in data {
-            if let JsonValue::Object(map) = item {
-                let mut new_map = serde_json::Map::new();
-
-                if let Some(include) = &selector.include {
-                    for field in include {
-                        if let Some(value) = map.get(field) {
-                            new_map.insert(field.clone(), value.clone());
-                        }
-                    }
-                } else if let Some(exclude) = &selector.exclude {
-                    for (key, value) in map {
-                        if !exclude.contains(key) {
-                            new_map.insert(key.clone(), value.clone());
-                        }
-                    }
-                } else {
-                    new_map = map.clone();
-                }
-
-                result.push(JsonValue::Object(new_map));
-            } else {
-                result.push(item.clone());
-            }
-        }
-
-        Ok(result)
-    }
-
-    fn apply_sort(&self, data: &[JsonValue], sort_keys: &[SortKey]) -> Result<Vec<JsonValue>> {
-        let mut result = data.to_vec();
-
-        result.sort_by(|a, b| {
-            for sort_key in sort_keys {
-                let a_val = self.get_field_for_sort(a, &sort_key.field);
-                let b_val = self.get_field_for_sort(b, &sort_key.field);
-
-                let cmp = match (&a_val, &b_val) {
-                    (Some(JsonValue::Number(a)), Some(JsonValue::Number(b))) => a
-                        .as_f64()
-                        .partial_cmp(&b.as_f64())
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                    (Some(JsonValue::String(a)), Some(JsonValue::String(b))) => a.cmp(b),
-                    _ => std::cmp::Ordering::Equal,
-                };
-
-                let final_cmp = if sort_key.descending {
-                    cmp.reverse()
-                } else {
-                    cmp
-                };
-
-                if final_cmp != std::cmp::Ordering::Equal {
-                    return final_cmp;
-                }
-            }
-
-            std::cmp::Ordering::Equal
-        });
-
-        Ok(result)
-    }
-
-    fn get_field_for_sort(&self, value: &JsonValue, field: &str) -> Option<JsonValue> {
-        if let JsonValue::Object(map) = value {
-            map.get(field).cloned()
-        } else {
-            None
-        }
-    }
-
-    fn apply_pagination(&self, data: &[JsonValue]) -> Vec<JsonValue> {
-        let offset = self.offset.unwrap_or(0);
-        // `--limit 0` means "no limit", matching the bridge's convention
-        // (its list handlers only cap when limit > 0).
-        let limit = match self.limit {
-            None | Some(0) => usize::MAX,
-            Some(n) => n,
-        };
-
-        data.iter().skip(offset).take(limit).cloned().collect()
-    }
-}
-
+#[derive(Debug)]
 pub struct FieldSelector {
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
@@ -312,7 +28,7 @@ impl FieldSelector {
         }
     }
 
-    pub fn parse(input: &str) -> Result<Self> {
+    pub fn parse(input: &str) -> crate::error::Result<Self> {
         if input.starts_with('-') {
             // Exclude fields
             let fields: Vec<String> = input
@@ -323,12 +39,13 @@ impl FieldSelector {
             Ok(Self::exclude(fields))
         } else {
             // Include fields
-            let fields: Vec<String> = input.split(',').map(|s| s.trim().to_string()).collect();
+            let fields = input.split(',').map(|s| s.trim().to_string()).collect();
             Ok(Self::include(fields))
         }
     }
 }
 
+#[derive(Debug)]
 pub struct SortKey {
     pub field: String,
     pub descending: bool,
@@ -356,19 +73,137 @@ impl SortKey {
     }
 }
 
+/// Bridge command → array key for list-shaped response envelopes.
+///
+/// Single source of truth for *which* bridge commands return an array —
+/// derived from the handlers in `GhidraCliBridge.java` (each `handleXxx`
+/// adds its rows under exactly one key). Commands not listed here (single
+/// objects, mutation results, `graph_calls`' nodes/edges, …) are returned
+/// as a single item. The E2E suite asserts this table stays a subset of the
+/// bridge's dispatch `switch`.
+pub const ENVELOPES: &[(&str, &str)] = &[
+    ("list_functions", "functions"),
+    ("functions_range", "functions"),
+    ("tag_get", "functions"),
+    ("list_strings", "strings"),
+    ("list_imports", "imports"),
+    ("list_exports", "exports"),
+    ("memory_map", "blocks"),
+    ("xrefs_to", "xrefs"),
+    ("xrefs_from", "xrefs"),
+    ("xrefs_list", "xrefs"),
+    ("list_programs", "programs"),
+    ("find_string", "results"),
+    ("find_bytes", "results"),
+    ("find_function", "results"),
+    ("find_calls", "results"),
+    ("find_crypto", "results"),
+    ("find_interesting", "results"),
+    ("decompile_multi", "results"),
+    ("find_constant", "hits"),
+    ("find_instruction", "matches"),
+    ("disasm", "instructions"),
+    ("symbol_list", "symbols"),
+    ("symbol_get", "symbols"),
+    ("type_list", "types"),
+    ("tag_list", "tags"),
+    ("comment_list", "comments"),
+    ("comment_get", "comments"),
+    ("graph_callers", "callers"),
+    ("graph_callees", "callees"),
+    ("diff_programs", "matches"),
+];
+
+/// Non-array envelope keys that carry no rows — their presence never
+/// prevents unwrapping a table-mapped array key (e.g. `{hits, value, size,
+/// count}` from `find_constant`).
+const META_KEYS: &[&str] = &[
+    "count",
+    "target",
+    "function",
+    "command",
+    "status",
+    "current_program_name",
+    "has_current_program",
+    "data",
+    "pattern",
+    "scanned",
+    "truncated",
+    "value",
+    "size",
+    "method",
+    "program1",
+    "program2",
+    "summary",
+    "differ",
+];
+
+/// Unwrap bridge response envelopes into a flat array of objects.
+///
+/// Bridge returns envelopes like `{"count": N, "functions": [...]}`. This
+/// extracts the inner array so formatters can render individual items.
+/// `command` is the wire command that produced `value` (`BridgeClient::
+/// last_command()`); it selects the array key in [`ENVELOPES`] instead of
+/// guessing from key names.
+///
+/// Unwrapping additionally requires the mapped key to be present and every
+/// *other* top-level key to be metadata, so a response whose shape drifted
+/// from its table entry falls through to single-item passthrough (logged
+/// at debug) instead of silently dropping fields.
+///
+/// Single-item rule: `decompile` responses carry a `"code"` key and are
+/// rendered specially, so they are never unwrapped.
+/// Consuming: the array is moved out of the envelope, not cloned.
+pub fn unwrap_bridge_response(value: JsonValue, command: Option<&str>) -> Vec<JsonValue> {
+    // Already an array - return as-is
+    if let JsonValue::Array(arr) = value {
+        return arr;
+    }
+
+    // Must be an object to unwrap
+    let mut obj = match value {
+        JsonValue::Object(map) => map,
+        other => return vec![other],
+    };
+
+    // Single-item rule: decompile responses have a "code" key.
+    if obj.contains_key("code") {
+        return vec![JsonValue::Object(obj)];
+    }
+
+    let Some(key) = command
+        .and_then(|c| ENVELOPES.iter().find(|(cmd, _)| *cmd == c))
+        .map(|(_, k)| *k)
+    else {
+        tracing::debug!(
+            "unwrap: command {:?} not in ENVELOPES; single item",
+            command
+        );
+        return vec![JsonValue::Object(obj)];
+    };
+
+    if obj.contains_key(key)
+        && obj
+            .keys()
+            .all(|k| k == key || META_KEYS.contains(&k.as_str()))
+    {
+        if let Some(JsonValue::Array(arr)) = obj.remove(key) {
+            return arr;
+        }
+    }
+
+    tracing::debug!(
+        "unwrap: {:?} response does not match envelope {:?}; single item",
+        command,
+        key
+    );
+    vec![JsonValue::Object(obj)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_data_type_parsing() {
-        assert_eq!(
-            DataType::from_str("functions").unwrap(),
-            DataType::Functions
-        );
-        assert_eq!(DataType::from_str("fn").unwrap(), DataType::Functions);
-        assert_eq!(DataType::from_str("strings").unwrap(), DataType::Strings);
-    }
+    use crate::error::Result;
 
     #[test]
     fn test_field_selector_parse() {
@@ -390,39 +225,124 @@ mod tests {
         assert!(keys[1].descending);
     }
 
-    fn rows(n: usize) -> Vec<JsonValue> {
-        (0..n).map(|i| serde_json::json!({ "id": i })).collect()
+    #[test]
+    fn unwrap_array_passthrough() -> Result<()> {
+        let v = serde_json::json!([{"a": 1}, {"a": 2}]);
+        let rows = unwrap_bridge_response(v, None);
+        assert_eq!(rows.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_limit_zero_means_all_rows() {
-        // Regression: `--limit 0` used to produce take(0) => empty output
-        let mut query = Query::new(DataType::Functions);
-        query.limit = Some(0);
-        assert_eq!(query.apply_pagination(&rows(5)).len(), 5);
+    fn unwrap_envelope_extracts_inner_array() -> Result<()> {
+        let v = serde_json::json!({"count": 2, "functions": [{"name": "a"}, {"name": "b"}]});
+        let rows = unwrap_bridge_response(v, Some("list_functions"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "a");
+        Ok(())
     }
 
     #[test]
-    fn test_limit_none_means_all_rows() {
-        let query = Query::new(DataType::Functions);
-        assert_eq!(query.apply_pagination(&rows(5)).len(), 5);
+    fn unwrap_scalar_envelope_becomes_single_row() -> Result<()> {
+        let v = serde_json::json!({"command": "analyze", "status": "success"});
+        let rows = unwrap_bridge_response(v, Some("analyze"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["command"], "analyze");
+        Ok(())
     }
 
     #[test]
-    fn test_limit_applies_after_offset() {
-        let mut query = Query::new(DataType::Functions);
-        query.limit = Some(2);
-        query.offset = Some(1);
-        let page = query.apply_pagination(&rows(5));
-        assert_eq!(page.len(), 2);
-        assert_eq!(page[0]["id"], 1);
+    fn unwrap_decompile_code_preserved() -> Result<()> {
+        let v = serde_json::json!({"function": "main", "code": "int main() {}"});
+        let rows = unwrap_bridge_response(v, Some("decompile"));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("code").is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_limit_zero_with_offset_returns_remainder() {
-        let mut query = Query::new(DataType::Functions);
-        query.limit = Some(0);
-        query.offset = Some(2);
-        assert_eq!(query.apply_pagination(&rows(5)).len(), 3);
+    fn every_envelope_entry_unwraps_its_key() {
+        for &(cmd, key) in ENVELOPES {
+            let mut obj = serde_json::Map::new();
+            obj.insert("count".to_string(), serde_json::json!(2));
+            obj.insert(key.to_string(), serde_json::json!([{"n": 1}, {"n": 2}]));
+            let rows = unwrap_bridge_response(JsonValue::Object(obj), Some(cmd));
+            assert_eq!(rows.len(), 2, "cmd={} key={}", cmd, key);
+            assert_eq!(rows[0]["n"], 1, "cmd={} key={}", cmd, key);
+        }
+    }
+
+    /// Real envelope shapes from the bridge (meta keys alongside the array).
+    #[test]
+    fn real_envelope_shapes() {
+        let cases: &[(&str, &str)] = &[
+            // disasm: {instructions, count}
+            (
+                "disasm",
+                r#"{"instructions": [{"address": "00100000"}], "count": 1}"#,
+            ),
+            // find_constant: {value, size, hits, count}
+            (
+                "find_constant",
+                r#"{"value": "0x1505", "size": 4, "hits": [{"address": "00100051"}], "count": 1}"#,
+            ),
+            // tag_get: {target, functions, count}
+            (
+                "tag_get",
+                r#"{"target": "hook", "functions": [{"name": "main"}], "count": 1}"#,
+            ),
+        ];
+        for (cmd, body) in cases {
+            let v: JsonValue = serde_json::from_str(body).unwrap();
+            let rows = unwrap_bridge_response(v, Some(cmd));
+            assert_eq!(rows.len(), 1, "cmd={}", cmd);
+        }
+    }
+
+    #[test]
+    fn unknown_command_keeps_envelope_whole() {
+        // `graph_calls` returns {nodes, edges, …} — not in ENVELOPES.
+        let v = serde_json::json!({"nodes": [{}], "edges": [{}], "count": 2});
+        let rows = unwrap_bridge_response(v, Some("graph_calls"));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("nodes").is_some());
+    }
+
+    #[test]
+    fn drifted_shape_falls_back_to_single_item() {
+        // A table-mapped command whose response grew a non-meta top-level
+        // key must NOT be unwrapped (fields would be silently dropped).
+        let v = serde_json::json!({"instructions": [{}], "count": 1, "unexpected": true});
+        let rows = unwrap_bridge_response(v, Some("disasm"));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("unexpected").is_some());
+    }
+
+    /// CI guard: every ENVELOPES command must exist in the bridge's dispatch
+    /// `switch`, so the table can never name a command the bridge rejects.
+    #[test]
+    fn envelopes_are_dispatched_by_the_bridge() {
+        let java = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ghidra/scripts/GhidraCliBridge.java"
+        ))
+        .expect("GhidraCliBridge.java must exist in the repo");
+        // The command surface is declared either as a `case "cmd":` label
+        // (legacy dispatch switch) or a `r.register("cmd", ...)` entry
+        // (CommandRegistry). Either form counts as dispatched.
+        let dispatched = |cmd: &&str| {
+            java.contains(&format!("case \"{}\":", cmd))
+                || java.contains(&format!("register(\"{}\"", cmd))
+        };
+        let missing: Vec<&str> = ENVELOPES
+            .iter()
+            .filter(|(cmd, _)| !dispatched(cmd))
+            .map(|(cmd, _)| *cmd)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "ENVELOPES entries missing from the bridge command registry: {:?}",
+            missing
+        );
     }
 }

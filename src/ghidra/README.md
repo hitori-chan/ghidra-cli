@@ -102,7 +102,7 @@ See `ipc/client.rs`: `connect_with_retry()` waits out transient connect failures
 `GHIDRA_CLI_CONNECT_DEADLINE` (default 60s). A program request waits up to
 `GHIDRA_CLI_READ_TIMEOUT` (default 300s; `0` = indefinite), while long analyze/import
 operations use `GHIDRA_CLI_OP_TIMEOUT` (`0` or unset = indefinite). Use `ghidra jobs` to
-inspect work and `ghidra cancel [JOB_ID]` to request cancellation.
+inspect work and `gd cancel [JOB_ID]` to request cancellation.
 
 `shutdown` stops accepting new work and drains every program job accepted before it. The
 Rust lifecycle waits up to `GHIDRA_CLI_SHUTDOWN_TIMEOUT` (default 300s; `0` = indefinite)

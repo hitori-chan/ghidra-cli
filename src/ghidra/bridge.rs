@@ -323,6 +323,15 @@ pub fn import_oneshot(
     let headless_script = find_headless_script(ghidra_install_dir)?;
 
     let ghidra_project_dir = project_path.parent().unwrap_or(project_path);
+    // HeadlessAnalyzer refuses to create a project whose parent directory is
+    // missing ("Directory not found"); create it so `gd import --project
+    // any/new/path` works without pre-staging the directory.
+    std::fs::create_dir_all(ghidra_project_dir).with_context(|| {
+        format!(
+            "Failed to create project directory: {}",
+            ghidra_project_dir.display()
+        )
+    })?;
     let ghidra_project_name = project_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

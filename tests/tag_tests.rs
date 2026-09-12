@@ -526,7 +526,7 @@ fn test_csv_tags_join_with_semicolon() {
 #[test]
 fn test_clap_tag_add_requires_tags() {
     // `tag add f` must be a parse error, not TARGET-consumed-as-tag.
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .args(["tag", "add", "some_func"])
         .assert()
         .failure()
@@ -535,14 +535,14 @@ fn test_clap_tag_add_requires_tags() {
 
 #[test]
 fn test_clap_tag_remove_all_conflicts_with_tags() {
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .args(["tag", "remove", "some_func", "--all", "extra_tag"])
         .assert()
         .failure()
         .code(2);
 
     // Neither tags nor --all is also a parse error
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .args(["tag", "remove", "some_func"])
         .assert()
         .failure()
@@ -551,7 +551,7 @@ fn test_clap_tag_remove_all_conflicts_with_tags() {
 
 #[test]
 fn test_clap_untagged_conflicts_with_tag() {
-    assert_cmd::cargo::cargo_bin_cmd!("ghidra")
+    assert_cmd::cargo::cargo_bin_cmd!("gd")
         .args(["function", "list", "--tag", "x", "--untagged"])
         .assert()
         .failure()

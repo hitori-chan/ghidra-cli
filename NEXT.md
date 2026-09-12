@@ -16,6 +16,30 @@ The intended direction is:
 5. support checked-in Java scripts and multi-source modules as first-class jobs;
 6. stream large RE artifacts rather than materializing giant response arrays.
 
+## Implementation status (2026-09-12, v0.4.0)
+
+- **Slice 1 (communications/execution split)**: implemented — the responsive
+  bridge control plane below (job queue, control router, per-job monitors,
+  drain shutdown, `jobs`/`cancel`). Not yet: capability negotiation, executor
+  heartbeat, interrupted-job recovery, progress channel.
+- **Slice 2 (lifecycle & data correctness)**: partially implemented —
+  server-side filtering and offset pushdown landed (P6/P6.2 in
+  `docs/history/refactor-plan.md`: the bridge filters/pages while iterating,
+  the client pipeline re-runs authoritatively; 2.7× faster filtered queries,
+  O(offset+limit) paging on 34k-symbol programs). Still not implemented: no
+  `project verify`, no unified result envelope, no artifact manifest, no
+  streaming (JSONL) output.
+- **Slice 3 (durable corpus scheduler)**: not implemented — the next major
+  project.
+- **Slice 4 (script & module runtime)**: script `run` with args + `--expect`/
+  `--allow-empty` is implemented (PLAN.md 4.1); capability honesty is done
+  (inline `script java`/`script python` return clean errors and are no longer
+  advertised). Still not implemented: artifact manifest (4.2), module runtime
+  (4.3), machine-readable capabilities (4.4).
+- **Slice 5 (RE-native bulk export/apply)**: not implemented. (A real
+  cross-program `diff programs` via Google binDiff landed in 0.4.0 — a
+  standalone feature outside the slices, see `README.md`.)
+
 ## Implemented now: responsive bridge control plane
 
 The first "busy looks dead" slice is implemented in the
@@ -139,9 +163,9 @@ The current one-shot import path is the right structural fix for initial
 import: it commits the import before the persistent process-mode bridge opens
 the program. Analysis also calls `currentProgram.save`. These improvements do
 not remove the need for a first-class verification state, particularly for
-scripts and bulk writes. `stop_bridge` also still has a three-second graceful
-wait before it begins forceful termination, so shutdown must not be the only
-durability mechanism.
+scripts and bulk writes. `stop_bridge` drains for a configurable grace period
+(`GHIDRA_CLI_SHUTDOWN_TIMEOUT`, default 300 s) before forceful termination, so
+shutdown must not be the only durability mechanism.
 
 ### Tool output must be verified and fail closed
 
@@ -217,7 +241,7 @@ other settings that materially affect the resulting database.
 
 ### The old statement is too broad
 
-`PLAN-java-plugin.md` says that Ghidra headless is single-threaded for program
+`docs/history/plan-java-plugin.md` says that Ghidra headless is single-threaded for program
 access and therefore makes the socket accept loop sequential. This conflates
 three different questions:
 

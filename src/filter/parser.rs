@@ -273,6 +273,9 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> Result<Value> {
             Rule::identifier => {
                 return Ok(Value::String(inner.as_str().to_string()));
             }
+            Rule::unquoted_string => {
+                return Ok(Value::String(inner.as_str().to_string()));
+            }
             _ => {}
         }
     }
@@ -287,6 +290,45 @@ mod tests {
     fn test_parse_simple() {
         let filter = parse_filter("name=test").unwrap();
         assert!(matches!(filter.expr, FilterExpr::Compare { .. }));
+    }
+
+    #[test]
+    fn test_parse_digit_leading_string_values() {
+        // Addresses, versions, and other digit-leading string values must be
+        // filterable unquoted (they were rejected before the unquoted_string
+        // grammar fix).
+        let f = parse_filter("name~000").unwrap();
+        assert!(matches!(
+            f.expr,
+            FilterExpr::StringOp {
+                op: StringOp::Contains,
+                ..
+            }
+        ));
+
+        let f = parse_filter("name^1.2").unwrap();
+        if let FilterExpr::StringOp { op, value, .. } = f.expr {
+            assert!(matches!(op, StringOp::StartsWith));
+            assert_eq!(value, "1.2");
+        } else {
+            panic!("expected string op");
+        }
+
+        let f = parse_filter("address$49cb").unwrap();
+        if let FilterExpr::StringOp { op, value, .. } = f.expr {
+            assert!(matches!(op, StringOp::EndsWith));
+            assert_eq!(value, "49cb");
+        } else {
+            panic!("expected string op");
+        }
+    }
+
+    #[test]
+    fn test_parse_trailing_junk_is_rejected() {
+        // Anchoring (P7): garbage after a complete expression must not parse.
+        assert!(parse_filter("name=test garbage").is_err());
+        assert!(parse_filter("name=test AND").is_err());
+        assert!(parse_filter("(name=test) trailing").is_err());
     }
 
     #[test]

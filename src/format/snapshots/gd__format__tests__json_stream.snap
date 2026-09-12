@@ -1,0 +1,9 @@
+---
+source: src/format/mod.rs
+expression: "f.format(&rows, fmt).unwrap()"
+---
+{"address":"00401000","name":"main","size":78,"tags":["entry","auth"]}
+{"code":"int main() {\n  return 0;\n}\n","entry":"00401000","name":"main","params":[{"name":"argc","storage":":RDI","type":"int"}],"signature":"undefined main(void)","variables":[{"name":"lVar1","storage":":RAX","type":"long"}]}
+{"address":"00401010","bytes":"55","loaded":{"value":"0x1505"},"mnemonic":"PUSH","operands":["RBP"]}
+{"address":"00118b43","block":".text","ldr_refs":[],"zero_block":false}
+{"address":"00401000","call_site":"00401005","depth":1,"name":"main"}

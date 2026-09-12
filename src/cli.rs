@@ -1,8 +1,213 @@
 use clap::{ArgAction, Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+/// Shared metadata for command argument structs.
+///
+/// `main.rs` asks any command "which project/program does this target, does
+/// it take query options, does it need the bridge?" through this trait
+/// instead of per-command `match`es. Subcommand enums override [`meta`](Self::meta)
+/// to delegate to the active variant's arg struct; arg structs answer
+/// `project`/`program`/`query_options` directly (see the impls at the bottom
+/// of this file). A command variant that forgets to participate fails to
+/// compile instead of silently degrading in the old extraction matches.
+pub trait CommandMeta {
+    /// `--project` from the command's args, if the command accepts one.
+    fn project(&self) -> Option<&str>;
+    /// `--program` from the command's args, if the command accepts one.
+    fn program(&self) -> Option<&str>;
+    /// The command's query options, if it has them.
+    fn query_options(&self) -> Option<QueryOptions>;
+    /// Whether the command needs a live bridge. Default `false` is
+    /// fail-closed: a new command that does not opt in is rejected rather
+    /// than silently running without a bridge.
+    fn requires_bridge(&self) -> bool {
+        false
+    }
+    /// Subcommand enums override this to point at the active variant's arg
+    /// struct; arg structs keep the default (`self`).
+    fn meta(&self) -> &dyn CommandMeta
+    where
+        Self: Sized,
+    {
+        self
+    }
+}
+
+/// Argument struct for commands with no args of their own (used as the
+/// `meta()` fallback for command variants that carry no arg struct).
+struct NoCommandMeta;
+
+impl CommandMeta for NoCommandMeta {
+    fn project(&self) -> Option<&str> {
+        None
+    }
+    fn program(&self) -> Option<&str> {
+        None
+    }
+    fn query_options(&self) -> Option<QueryOptions> {
+        None
+    }
+}
+
+static NO_COMMAND_META: NoCommandMeta = NoCommandMeta;
+
+/// Target selector shared by commands that take a positional TARGET or a
+/// `--target` flag (function/symbol name, or 0xADDRESS). The `--target` flag
+/// wins when both are given.
+#[derive(Args, Clone, Default, Debug, Serialize, Deserialize)]
+pub struct TargetArgs {
+    /// Target (name | 0xaddr | FUN_<hex>)
+    #[arg(value_name = "TARGET", required_unless_present = "target")]
+    pub positional_target: Option<String>,
+    /// Target (name | 0xaddr | FUN_<hex>)
+    #[arg(long = "target", value_name = "TARGET")]
+    pub target: Option<String>,
+}
+
+impl TargetArgs {
+    /// Resolve the target, preferring the explicit `--target` flag.
+    pub fn resolved_target(&self) -> &str {
+        self.target
+            .as_deref()
+            .or(self.positional_target.as_deref())
+            .expect("clap should ensure target is provided")
+    }
+}
+
+/// Shared project/program targeting for bridge lifecycle commands
+/// (start/stop/restart/status/ping/jobs/cancel). Both fields are optional:
+/// the global `--project`/`--program` flags and `$GD_PROJECT`/`$GD_PROGRAM`
+/// fill the gaps, then the config defaults.
+#[derive(Args, Clone, Default, Debug, Serialize, Deserialize)]
+pub struct BridgeTargetArgs {
+    /// Project path
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Program name to load
+    #[arg(long)]
+    pub program: Option<String>,
+}
+
+/// Implement `CommandMeta` for an arg struct that flattens `QueryOptions`
+/// (`pub options: QueryOptions`): project/program/options all come from it.
+macro_rules! impl_options_meta {
+    ($t:ty) => {
+        impl CommandMeta for $t {
+            fn project(&self) -> Option<&str> {
+                self.options.project.as_deref()
+            }
+            fn program(&self) -> Option<&str> {
+                self.options.program.as_deref()
+            }
+            fn query_options(&self) -> Option<QueryOptions> {
+                Some(self.options.clone())
+            }
+        }
+    };
+}
+
+/// Implement `CommandMeta` for an arg struct with its own `project` and
+/// `program` `Option<String>` fields (no query options).
+macro_rules! impl_bridge_target_meta {
+    ($t:ty) => {
+        impl CommandMeta for $t {
+            fn project(&self) -> Option<&str> {
+                self.project.as_deref()
+            }
+            fn program(&self) -> Option<&str> {
+                self.program.as_deref()
+            }
+            fn query_options(&self) -> Option<QueryOptions> {
+                None
+            }
+        }
+    };
+}
+
+/// Target/project meta for commands that carry their own `--format` field
+/// instead of flattening QueryOptions. Without the synthesized options an
+/// explicit `-o/--format` would be silently ignored on those commands.
+macro_rules! impl_meta_with_format {
+    ($t:ty, with_program) => {
+        impl CommandMeta for $t {
+            fn project(&self) -> Option<&str> {
+                self.project.as_deref()
+            }
+            fn program(&self) -> Option<&str> {
+                self.program.as_deref()
+            }
+            fn query_options(&self) -> Option<QueryOptions> {
+                Some(QueryOptions {
+                    program: None,
+                    project: None,
+                    filter: None,
+                    fields: None,
+                    format: self.format.clone(),
+                    limit: None,
+                    offset: None,
+                    sort: None,
+                    count: false,
+                    json: false,
+                })
+            }
+        }
+    };
+    ($t:ty, no_program) => {
+        impl CommandMeta for $t {
+            fn project(&self) -> Option<&str> {
+                self.project.as_deref()
+            }
+            fn program(&self) -> Option<&str> {
+                None
+            }
+            fn query_options(&self) -> Option<QueryOptions> {
+                Some(QueryOptions {
+                    program: None,
+                    project: None,
+                    filter: None,
+                    fields: None,
+                    format: self.format.clone(),
+                    limit: None,
+                    offset: None,
+                    sort: None,
+                    count: false,
+                    json: false,
+                })
+            }
+        }
+    };
+}
+
+/// Implement `CommandMeta` for a subcommand enum: one `meta()` match maps
+/// each variant to its arg struct; the accessors delegate through it and
+/// `requires_bridge` is `true` because every variant of a bridge-group enum
+/// needs the bridge.
+macro_rules! impl_enum_meta {
+    ($e:ident, $($variant:ident($field:ident)),* $(,)?) => {
+        impl CommandMeta for $e {
+            fn requires_bridge(&self) -> bool {
+                true
+            }
+            fn meta(&self) -> &dyn CommandMeta {
+                match self {
+                    $(Self::$variant($field) => $field,)*
+                }
+            }
+            fn project(&self) -> Option<&str> {
+                self.meta().project()
+            }
+            fn program(&self) -> Option<&str> {
+                self.meta().program()
+            }
+            fn query_options(&self) -> Option<QueryOptions> {
+                self.meta().query_options()
+            }
+        }
+    };
+}
+
 #[derive(Parser)]
-#[command(name = "ghidra")]
+#[command(name = "gd")]
 #[command(version, about = "Rust CLI for Ghidra reverse engineering", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
@@ -110,6 +315,16 @@ pub enum Commands {
     #[command(alias = "disassemble", alias = "dis")]
     Disasm(DisasmArgs),
 
+    /// Decompile several addresses in one bridge round trip
+    #[command(name = "decompile-multi", alias = "dmulti")]
+    DecompileMulti(DecompileMultiArgs),
+
+    /// Send a raw bridge command with a JSON args payload (escape hatch for
+    /// bridge commands that have no dedicated subcommand, e.g. find_constant,
+    /// read_memory, write_memory)
+    #[command(name = "raw")]
+    Raw(RawArgs),
+
     /// Diff operations
     #[command(subcommand)]
     Diff(DiffCommands),
@@ -160,62 +375,34 @@ pub enum Commands {
     Analyze(AnalyzeArgs),
 
     /// Start the bridge
-    Start {
-        /// Project path
-        #[arg(long)]
-        project: Option<String>,
-        /// Program name to load
-        #[arg(long)]
-        program: Option<String>,
-    },
+    Start(BridgeTargetArgs),
 
     /// Stop the bridge
-    Stop {
-        /// Project path
-        #[arg(long)]
-        project: Option<String>,
-    },
+    Stop(BridgeTargetArgs),
 
     /// Restart the bridge
-    Restart {
-        /// Project path
-        #[arg(long)]
-        project: Option<String>,
-        /// Program name to load
-        #[arg(long)]
-        program: Option<String>,
-    },
+    Restart(BridgeTargetArgs),
 
     /// Show bridge status
-    Status {
-        /// Project path
-        #[arg(long)]
-        project: Option<String>,
-    },
+    Status(BridgeTargetArgs),
 
     /// Ping the bridge
-    Ping {
-        /// Project path
-        #[arg(long)]
-        project: Option<String>,
-    },
+    Ping(BridgeTargetArgs),
 
     /// List active, queued, and recently completed bridge jobs
     Jobs {
         /// Show one job by ID; omit for the bridge queue and recent jobs
         job_id: Option<u64>,
-        /// Project path
-        #[arg(long)]
-        project: Option<String>,
+        #[command(flatten)]
+        target: BridgeTargetArgs,
     },
 
     /// Request cooperative cancellation of a bridge job (defaults to active job)
     Cancel {
         /// Job ID; omit to cancel the currently active job
         job_id: Option<u64>,
-        /// Project path
-        #[arg(long)]
-        project: Option<String>,
+        #[command(flatten)]
+        target: BridgeTargetArgs,
     },
 
     /// Download and setup Ghidra automatically
@@ -226,7 +413,7 @@ pub enum Commands {
     Rename(RenameArgs),
 }
 
-#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+#[derive(Args, Clone, Default, Serialize, Deserialize, Debug)]
 pub struct QueryArgs {
     /// Data type to query (functions, strings, imports, etc.)
     pub data_type: String,
@@ -249,7 +436,8 @@ pub struct QueryArgs {
     #[arg(long)]
     pub fields: Option<String>,
 
-    /// Output format
+    /// Output format (full, compact, minimal, json, json-compact,
+    /// json-stream, csv, tsv, table, ids, count, tree, asm, c)
     #[arg(long, short = 'o')]
     pub format: Option<String>,
 
@@ -379,23 +567,10 @@ pub struct FunctionListArgs {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct FunctionGetArgs {
-    /// Function target (name/address/FUN_...)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     #[command(flatten)]
     pub options: QueryOptions,
-}
-
-impl FunctionGetArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -420,12 +595,8 @@ pub struct CreateFunctionArgs {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct FunctionDecompileArgs {
-    /// Function target (name/address/FUN_...)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     /// Include local variable details (name, type, storage)
     #[arg(long)]
     pub with_vars: bool,
@@ -436,23 +607,10 @@ pub struct FunctionDecompileArgs {
     pub options: QueryOptions,
 }
 
-impl FunctionDecompileArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
-}
-
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct SetSignatureArgs {
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     /// C-style signature string, e.g. "int main(int argc, char** argv)"
     #[arg(long)]
     pub signature: String,
@@ -462,23 +620,10 @@ pub struct SetSignatureArgs {
     pub project: Option<String>,
 }
 
-impl SetSignatureArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
-}
-
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct SetReturnTypeArgs {
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     /// Return type name
     #[arg(long = "type")]
     pub return_type: String,
@@ -488,23 +633,10 @@ pub struct SetReturnTypeArgs {
     pub project: Option<String>,
 }
 
-impl SetReturnTypeArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
-}
-
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct SetCallingConventionArgs {
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     /// Calling convention name (e.g., "__cdecl", "__stdcall", "__fastcall")
     #[arg(long)]
     pub convention: String,
@@ -514,23 +646,10 @@ pub struct SetCallingConventionArgs {
     pub project: Option<String>,
 }
 
-impl SetCallingConventionArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
-}
-
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct SetVarTypeArgs {
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     /// Variable name to retype
     #[arg(long = "var")]
     pub var_name: String,
@@ -541,15 +660,6 @@ pub struct SetVarTypeArgs {
     pub program: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
-}
-
-impl SetVarTypeArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
 }
 
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
@@ -650,23 +760,10 @@ pub enum XRefCommands {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct XRefArgs {
-    /// XRef target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// XRef target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     #[command(flatten)]
     pub options: QueryOptions,
-}
-
-impl XRefArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
 }
 
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
@@ -964,6 +1061,40 @@ pub struct CommentSetArgs {
     pub project: Option<String>,
 }
 
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct FindInstructionArgs {
+    /// Substring to match in instruction disassembly (e.g. "bl srand")
+    pub pattern: String,
+    /// Restrict scan to instructions at or after this address
+    #[arg(long)]
+    pub start: Option<String>,
+    /// Restrict scan to instructions at or before this address
+    #[arg(long)]
+    pub end: Option<String>,
+    /// Case-sensitive match (default: case-insensitive)
+    #[arg(long)]
+    pub case_sensitive: bool,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct FindConstantArgs {
+    /// Constant value to search for (hex, e.g. 0x8031)
+    pub value: String,
+    /// Byte width of the constant (2, 4, or 8; default 4)
+    #[arg(long, default_value_t = 4)]
+    pub size: usize,
+    /// Maximum number of hits (default 100)
+    #[arg(long, default_value_t = 100)]
+    pub max: usize,
+    /// Skip scanning for ARM LDR literal-pool references
+    #[arg(long)]
+    pub no_refs: bool,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
 pub enum FindCommands {
     /// Find strings
@@ -971,6 +1102,12 @@ pub enum FindCommands {
     String(FindStringArgs),
     /// Find byte patterns
     Bytes(FindBytesArgs),
+    /// Find constant value references (byte scan + ARM LDR literal-pool refs)
+    #[command(name = "constant")]
+    Constant(FindConstantArgs),
+    /// Find instructions matching a text pattern (works without xrefs)
+    #[command(name = "instruction")]
+    Instruction(FindInstructionArgs),
     /// Find functions
     #[command(alias = "func", alias = "fn", alias = "functions")]
     Function(FindFunctionArgs),
@@ -1007,23 +1144,10 @@ pub struct FindFunctionArgs {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct FindCallsArgs {
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     #[command(flatten)]
     pub options: QueryOptions,
-}
-
-impl FindCallsArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
 }
 
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
@@ -1042,25 +1166,12 @@ pub enum GraphCommands {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct GraphFunctionArgs {
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     #[arg(long)]
     pub depth: Option<usize>,
     #[command(flatten)]
     pub options: QueryOptions,
-}
-
-impl GraphFunctionArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -1074,12 +1185,8 @@ pub struct GraphExportArgs {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct DecompileArgs {
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Function target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     /// Include local variable details (name, type, storage)
     #[arg(long)]
     pub with_vars: bool,
@@ -1090,62 +1197,91 @@ pub struct DecompileArgs {
     pub options: QueryOptions,
 }
 
-impl DecompileArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
-}
-
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct DisasmArgs {
-    /// Disassembly target (name | 0xaddr | FUN_<hex>)
-    #[arg(value_name = "TARGET", required_unless_present = "target")]
-    pub positional_target: Option<String>,
-    /// Disassembly target (name | 0xaddr | FUN_<hex>)
-    #[arg(long = "target", value_name = "TARGET")]
-    pub target: Option<String>,
+    #[command(flatten)]
+    pub target: TargetArgs,
     /// Number of instructions to disassemble
     #[arg(long = "instructions", short = 'n')]
     pub num_instructions: Option<usize>,
+    /// Disassemble until this address (range mode; use instead of -n)
+    #[arg(long)]
+    pub end: Option<String>,
+    /// Do not resolve literal pool loads (faster, no `loaded` fields)
+    #[arg(long)]
+    pub no_resolve: bool,
     #[command(flatten)]
     pub options: QueryOptions,
 }
 
-impl DisasmArgs {
-    pub fn resolved_target(&self) -> &str {
-        self.target
-            .as_deref()
-            .or(self.positional_target.as_deref())
-            .expect("clap should ensure target is provided")
-    }
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct DecompileMultiArgs {
+    /// One or more function targets (name | 0xaddr | FUN_<hex>)
+    pub targets: Vec<String>,
+    #[command(flatten)]
+    pub options: QueryOptions,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct RawArgs {
+    /// Bridge command name (e.g. find_constant, decompile_multi, read_memory, ping)
+    pub command: String,
+    /// JSON object payload sent as the command args (default "{}")
+    // NB: field name must not be `json` — that arg id collides with the
+    // flattened QueryOptions `--json` flag and breaks positional parsing.
+    #[arg(value_name = "JSON", default_value = "{}")]
+    pub json_args: String,
+    #[command(flatten)]
+    pub options: QueryOptions,
 }
 
 #[derive(Subcommand, Clone, Serialize, Deserialize, Debug)]
 pub enum DiffCommands {
-    /// Compare two programs
+    /// Real cross-program diff via Google binDiff (function matching + similarity).
+    /// Requires the BinDiff integration: set `bindiff.binexport_jar` in the config
+    /// (and optionally `bindiff.differ` for the native differ binary).
     Programs(DiffProgramsArgs),
-    /// Compare functions
+    /// Naive line-by-line diff of decompiled C (same program only; no alignment, not BinDiff)
     Functions(DiffFunctionsArgs),
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct DiffProgramsArgs {
-    pub program1: String,
-    pub program2: String,
+    /// First program (defaults to the loaded program when omitted)
+    #[arg(required_unless_present = "program2")]
+    pub program1: Option<String>,
+    /// Second program (by project name)
+    #[arg(required_unless_present = "program1")]
+    pub program2: Option<String>,
+    /// Only show non-identical matches (similarity < 1.0)
+    #[arg(long)]
+    pub changed: bool,
+    /// Also list unmatched functions (present in only one of the programs);
+    /// listed before the matches so a row cap always shows them
+    #[arg(long)]
+    pub unmatched: bool,
+    /// Minimum similarity to show (0.0..=1.0; default 0.0)
+    #[arg(long)]
+    pub min_sim: Option<f64>,
+    /// Only matches whose primary or secondary name contains this substring
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Max rows to return (0 = all; default from config)
+    #[arg(long)]
+    pub limit: Option<usize>,
     #[arg(long)]
     pub format: Option<String>,
+    #[arg(long)]
+    pub program: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct DiffFunctionsArgs {
-    /// First function (name or address)
+    /// First function (name or address), in the loaded program
     pub func1: String,
-    /// Second function (name or address)
+    /// Second function (name or address), in the loaded program
     pub func2: String,
     #[arg(long)]
     pub format: Option<String>,
@@ -1314,7 +1450,7 @@ pub struct AnalyzeArgs {
 }
 
 /// Common query options used across commands
-#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+#[derive(Args, Clone, Default, Serialize, Deserialize, Debug)]
 pub struct QueryOptions {
     #[arg(long)]
     pub program: Option<String>,
@@ -1367,6 +1503,327 @@ pub struct SetupArgs {
     pub force: bool,
 }
 
+// ── CommandMeta impls ────────────────────────────────────────────────────────
+// QueryOptions itself (several subcommand variants carry it directly).
+impl CommandMeta for QueryOptions {
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn program(&self) -> Option<&str> {
+        self.program.as_deref()
+    }
+    fn query_options(&self) -> Option<QueryOptions> {
+        Some(self.clone())
+    }
+}
+
+// QueryArgs carries the query fields directly (no flattened QueryOptions).
+impl CommandMeta for QueryArgs {
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    fn program(&self) -> Option<&str> {
+        self.program.as_deref()
+    }
+    fn query_options(&self) -> Option<QueryOptions> {
+        Some(QueryOptions {
+            program: self.program.clone(),
+            project: self.project.clone(),
+            filter: self.filter.clone(),
+            fields: self.fields.clone(),
+            format: self.format.clone(),
+            limit: self.limit,
+            offset: self.offset,
+            sort: self.sort.clone(),
+            count: self.count,
+            json: self.json,
+        })
+    }
+}
+
+// Raw passes its JSON payload through verbatim: limit/filter live inside the
+// JSON, so it has project/program but intentionally no query options.
+impl CommandMeta for RawArgs {
+    fn project(&self) -> Option<&str> {
+        self.options.project.as_deref()
+    }
+    fn program(&self) -> Option<&str> {
+        self.options.program.as_deref()
+    }
+    fn query_options(&self) -> Option<QueryOptions> {
+        None
+    }
+}
+
+// Option-bearing arg structs (flattened `pub options: QueryOptions`).
+impl_options_meta!(FunctionListArgs);
+impl_options_meta!(FunctionGetArgs);
+impl_options_meta!(FunctionDecompileArgs);
+impl_options_meta!(StringRefsArgs);
+impl_options_meta!(SymbolGetArgs);
+impl_options_meta!(MemReadArgs);
+impl_options_meta!(MemSearchArgs);
+impl_options_meta!(XRefArgs);
+impl_options_meta!(TypeGetArgs);
+impl_options_meta!(TagListArgs);
+impl_options_meta!(TagGetArgs);
+impl_options_meta!(CommentGetArgs);
+impl_options_meta!(FindInstructionArgs);
+impl_options_meta!(FindConstantArgs);
+impl_options_meta!(FindStringArgs);
+impl_options_meta!(FindBytesArgs);
+impl_options_meta!(FindFunctionArgs);
+impl_options_meta!(FindCallsArgs);
+impl_options_meta!(GraphFunctionArgs);
+impl_options_meta!(GraphExportArgs);
+impl_options_meta!(DecompileArgs);
+impl_options_meta!(DisasmArgs);
+impl_options_meta!(DecompileMultiArgs);
+impl_options_meta!(StatsArgs);
+impl_options_meta!(SummaryArgs);
+
+// Arg structs with their own project/program fields (no query options).
+impl_bridge_target_meta!(SetSignatureArgs);
+impl_bridge_target_meta!(SetReturnTypeArgs);
+impl_bridge_target_meta!(SetCallingConventionArgs);
+impl_bridge_target_meta!(SetVarTypeArgs);
+impl_bridge_target_meta!(ImportArgs);
+impl_bridge_target_meta!(AnalyzeArgs);
+impl_bridge_target_meta!(RenameArgs);
+impl_bridge_target_meta!(CreateFunctionArgs);
+impl_bridge_target_meta!(CreateSymbolArgs);
+impl_bridge_target_meta!(MemWriteArgs);
+impl_bridge_target_meta!(CreateTypeArgs);
+impl_bridge_target_meta!(ApplyTypeArgs);
+impl_bridge_target_meta!(TypeDeleteArgs);
+impl_bridge_target_meta!(TypeRenameArgs);
+impl_bridge_target_meta!(CreateEnumArgs);
+impl_bridge_target_meta!(TypedefArgs);
+impl_bridge_target_meta!(TypeAddFieldArgs);
+impl_bridge_target_meta!(TypeDelFieldArgs);
+impl_bridge_target_meta!(TagCreateArgs);
+impl_bridge_target_meta!(TagDeleteArgs);
+impl_bridge_target_meta!(TagRenameArgs);
+impl_bridge_target_meta!(TagSetCommentArgs);
+impl_bridge_target_meta!(TagAttachArgs);
+impl_bridge_target_meta!(TagDetachArgs);
+impl_bridge_target_meta!(CommentSetArgs);
+impl_bridge_target_meta!(PatchBytesArgs);
+impl_bridge_target_meta!(PatchNopArgs);
+impl_bridge_target_meta!(PatchExportArgs);
+impl_bridge_target_meta!(ScriptRunArgs);
+impl_bridge_target_meta!(ScriptInlineArgs);
+impl_bridge_target_meta!(ProgramTargetArgs);
+impl_bridge_target_meta!(ExportArgs);
+impl_bridge_target_meta!(BatchArgs);
+
+// Project-only arg structs.
+impl_meta_with_format!(DiffProgramsArgs, with_program);
+impl_meta_with_format!(DiffFunctionsArgs, no_program);
+
+// Subcommand enums: delegate to the active variant's arg struct.
+// FunctionCommands::Delete reuses FunctionGetArgs (a target + query options).
+impl_enum_meta!(
+    FunctionCommands,
+    List(args),
+    Decompile(args),
+    Get(args),
+    Disasm(args),
+    Calls(args),
+    XRefs(args),
+    Rename(args),
+    Create(args),
+    Delete(args),
+    SetSignature(args),
+    SetReturnType(args),
+    SetCallingConvention(args),
+    SetVarType(args)
+);
+impl_enum_meta!(StringsCommands, List(opts), Refs(args));
+impl_enum_meta!(
+    MemoryCommands,
+    Map(opts),
+    Read(args),
+    Write(args),
+    Search(args)
+);
+impl_enum_meta!(
+    DumpCommands,
+    Imports(opts),
+    Exports(opts),
+    Functions(opts),
+    Strings(opts)
+);
+impl_enum_meta!(XRefCommands, To(args), From(args), List(args));
+impl_enum_meta!(
+    FindCommands,
+    String(args),
+    Bytes(args),
+    Constant(args),
+    Instruction(args),
+    Function(args),
+    Calls(args),
+    Crypto(opts),
+    Interesting(opts)
+);
+impl_enum_meta!(
+    GraphCommands,
+    Calls(opts),
+    Callers(args),
+    Callees(args),
+    Export(args)
+);
+impl_enum_meta!(
+    CommentCommands,
+    List(opts),
+    Get(args),
+    Set(args),
+    Delete(args)
+);
+impl_enum_meta!(
+    SymbolCommands,
+    List(opts),
+    Get(args),
+    Create(args),
+    Delete(args),
+    Rename(args)
+);
+impl_enum_meta!(
+    TypeCommands,
+    List(opts),
+    Get(args),
+    Create(args),
+    Apply(args),
+    Delete(args),
+    Rename(args),
+    CreateEnum(args),
+    Typedef(args),
+    AddField(args),
+    DelField(args)
+);
+impl_enum_meta!(
+    TagCommands,
+    List(args),
+    Get(args),
+    Create(args),
+    Delete(args),
+    Rename(args),
+    SetComment(args),
+    Add(args),
+    Remove(args)
+);
+impl_enum_meta!(PatchCommands, Bytes(args), Nop(args), Export(args));
+// ScriptCommands has a unit variant (List), so it is written by hand.
+impl CommandMeta for ScriptCommands {
+    fn requires_bridge(&self) -> bool {
+        true
+    }
+    fn meta(&self) -> &dyn CommandMeta {
+        match self {
+            Self::Run(args) => args,
+            Self::Python(args) => args,
+            Self::Java(args) => args,
+            Self::List => &NO_COMMAND_META,
+        }
+    }
+    fn project(&self) -> Option<&str> {
+        self.meta().project()
+    }
+    fn program(&self) -> Option<&str> {
+        self.meta().program()
+    }
+    fn query_options(&self) -> Option<QueryOptions> {
+        self.meta().query_options()
+    }
+}
+impl_enum_meta!(
+    ProgramCommands,
+    List(args),
+    Open(args),
+    Close(args),
+    Delete(args),
+    Info(args),
+    Export(args)
+);
+impl_enum_meta!(DiffCommands, Programs(args), Functions(args));
+
+// Top-level command enum. `requires_bridge` lists the bridge groups
+// explicitly (fail-closed default for anything else); `meta` delegates to
+// the variant's arg struct or subcommand enum.
+impl CommandMeta for Commands {
+    fn requires_bridge(&self) -> bool {
+        matches!(
+            self,
+            Commands::Import(_)
+                | Commands::Analyze(_)
+                | Commands::Query(_)
+                | Commands::Decompile(_)
+                | Commands::Function(_)
+                | Commands::Strings(_)
+                | Commands::Memory(_)
+                | Commands::Dump(_)
+                | Commands::Summary(_)
+                | Commands::XRef(_)
+                | Commands::Symbol(_)
+                | Commands::Type(_)
+                | Commands::Tag(_)
+                | Commands::Comment(_)
+                | Commands::Graph(_)
+                | Commands::Find(_)
+                | Commands::Diff(_)
+                | Commands::Patch(_)
+                | Commands::Script(_)
+                | Commands::Disasm(_)
+                | Commands::DecompileMulti(_)
+                | Commands::Raw(_)
+                | Commands::Batch(_)
+                | Commands::Stats(_)
+                | Commands::Program(_)
+                | Commands::Rename(_)
+        )
+    }
+    fn meta(&self) -> &dyn CommandMeta {
+        match self {
+            Commands::Query(args) => args,
+            Commands::Summary(args) => args,
+            Commands::Decompile(args) => args,
+            Commands::Disasm(args) => args,
+            Commands::DecompileMulti(args) => args,
+            Commands::Stats(args) => args,
+            Commands::Raw(args) => args,
+            Commands::Import(args) => args,
+            Commands::Analyze(args) => args,
+            Commands::Batch(args) => args,
+            Commands::Rename(args) => args,
+            Commands::Function(cmd) => cmd,
+            Commands::Strings(cmd) => cmd,
+            Commands::Memory(cmd) => cmd,
+            Commands::Dump(cmd) => cmd,
+            Commands::XRef(cmd) => cmd,
+            Commands::Symbol(cmd) => cmd,
+            Commands::Type(cmd) => cmd,
+            Commands::Tag(cmd) => cmd,
+            Commands::Comment(cmd) => cmd,
+            Commands::Find(cmd) => cmd,
+            Commands::Graph(cmd) => cmd,
+            Commands::Patch(cmd) => cmd,
+            Commands::Script(cmd) => cmd,
+            Commands::Program(cmd) => cmd,
+            Commands::Diff(cmd) => cmd,
+            _ => &NO_COMMAND_META,
+        }
+    }
+    fn project(&self) -> Option<&str> {
+        self.meta().project()
+    }
+    fn program(&self) -> Option<&str> {
+        self.meta().program()
+    }
+    fn query_options(&self) -> Option<QueryOptions> {
+        self.meta().query_options()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1376,7 +1833,9 @@ mod tests {
         let cli = Cli::try_parse_from(["ghidra", "decompile", "--target", "FUN_00401000"])
             .expect("decompile --target should parse");
         match cli.command {
-            Commands::Decompile(args) => assert_eq!(args.resolved_target(), "FUN_00401000"),
+            Commands::Decompile(args) => {
+                assert_eq!(args.target.resolved_target(), "FUN_00401000")
+            }
             _ => panic!("expected decompile command"),
         }
     }
@@ -1387,9 +1846,55 @@ mod tests {
             .expect("function get positional target should parse");
         match cli.command {
             Commands::Function(FunctionCommands::Get(args)) => {
-                assert_eq!(args.resolved_target(), "main");
+                assert_eq!(args.target.resolved_target(), "main");
             }
             _ => panic!("expected function get command"),
         }
+    }
+
+    #[test]
+    fn command_meta_bridge_groups() {
+        use CommandMeta as _;
+        // Bridge groups report themselves as bridge commands...
+        assert!(Commands::Decompile(DecompileArgs {
+            target: TargetArgs::default(),
+            with_vars: false,
+            with_params: false,
+            options: QueryOptions::default(),
+        })
+        .requires_bridge());
+        // ...while management commands do not (fail-closed default).
+        assert!(!Commands::Doctor.requires_bridge());
+        assert!(!Commands::Init.requires_bridge());
+        assert!(!Commands::Project(ProjectArgs {
+            command: ProjectCommands::List,
+        })
+        .requires_bridge());
+
+        // Project/program extraction flows through the trait.
+        let cmd = Commands::Function(FunctionCommands::Get(FunctionGetArgs {
+            target: TargetArgs::default(),
+            options: QueryOptions {
+                project: Some("proj".into()),
+                program: Some("prog".into()),
+                ..Default::default()
+            },
+        }));
+        assert_eq!(cmd.project(), Some("proj"));
+        assert_eq!(cmd.program(), Some("prog"));
+        assert!(cmd.query_options().is_some());
+
+        // QueryArgs builds its QueryOptions from its own fields.
+        let q = Commands::Query(QueryArgs::default());
+        assert!(q.project().is_none());
+        assert!(q.query_options().is_some());
+
+        // Raw has project/program but no query options.
+        let raw = Commands::Raw(RawArgs {
+            command: "ping".into(),
+            json_args: "{}".into(),
+            options: QueryOptions::default(),
+        });
+        assert!(raw.query_options().is_none());
     }
 }

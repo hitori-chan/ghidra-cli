@@ -11,6 +11,9 @@ pub mod config;
 #[path = "ipc/mod.rs"]
 pub mod ipc;
 
+#[path = "bindiff.rs"]
+pub mod bindiff;
+
 /// Re-export bridge module for integration tests.
 #[path = "ghidra"]
 pub mod ghidra {

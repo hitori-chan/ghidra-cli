@@ -24,6 +24,8 @@ import ghidra.program.model.pcode.LocalSymbolMap;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.app.util.importer.AutoImporter;
 import ghidra.app.util.importer.MessageLog;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.program.util.GhidraProgramUtilities;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.DomainFolder;
 import ghidra.framework.model.DomainObject;
@@ -31,6 +33,8 @@ import ghidra.framework.model.Project;
 import ghidra.framework.model.ProjectData;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressFactory;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
@@ -39,14 +43,23 @@ import ghidra.program.model.symbol.*;
 import ghidra.util.task.TaskMonitor;
 import ghidra.util.task.TaskMonitorAdapter;
 
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.InputStream;
+import java.util.jar.JarFile;
+import java.util.zip.ZipEntry;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -113,6 +126,146 @@ public class GhidraCliBridge extends GhidraScript {
 
     private static final Pattern NAMED_HEX_ADDRESS_PATTERN =
         Pattern.compile("(?i)^(?:FUN|SUB|LAB|DAT)_([0-9a-f]+)$");
+
+    /**
+     * Command registry: one line per bridge command (name, description,
+     * handler). Built once; replaces the old 90-case dispatch switch. The
+     * descriptions also power the additive `help` control command, so the
+     * CLI can learn the supported command set from a running bridge.
+     */
+    static class CommandRegistry {
+        @FunctionalInterface
+        interface Handler {
+            JsonObject invoke(GhidraCliBridge bridge, JsonObject args);
+        }
+
+        private final Map<String, Handler> handlers = new LinkedHashMap<>();
+        private final Map<String, String> descriptions = new LinkedHashMap<>();
+
+        void register(String name, String description, Handler handler) {
+            handlers.put(name, handler);
+            descriptions.put(name, description);
+        }
+
+        /** @return the handler's result, or null for an unknown command. */
+        JsonObject dispatch(GhidraCliBridge bridge, String command, JsonObject args) {
+            Handler handler = handlers.get(command);
+            if (handler == null) {
+                return null;
+            }
+            return handler.invoke(bridge, args);
+        }
+
+        JsonObject help() {
+            JsonArray commands = new JsonArray();
+            for (Map.Entry<String, String> entry : descriptions.entrySet()) {
+                JsonObject item = new JsonObject();
+                item.addProperty("name", entry.getKey());
+                item.addProperty("description", entry.getValue());
+                commands.add(item);
+            }
+            JsonObject result = new JsonObject();
+            result.add("commands", commands);
+            result.addProperty("count", commands.size());
+            return result;
+        }
+    }
+
+    private final CommandRegistry registry = buildRegistry();
+
+    private CommandRegistry buildRegistry() {
+        CommandRegistry r = new CommandRegistry();
+        r.register("program_info", "Current program metadata (name, language, address range, counts)",
+            (b, args) -> handleProgramInfo());
+        r.register("list_functions", "List functions (name filter, tags, untagged, limit)",
+            (b, args) -> handleListFunctions(args));
+        r.register("get_function", "Details for one function", (b, args) -> handleGetFunction(args));
+        r.register("rename_function", "Rename a function", (b, args) -> handleRenameFunction(args));
+        r.register("create_function", "Create a function at an address", (b, args) -> handleCreateFunction(args));
+        r.register("delete_function", "Delete a function", (b, args) -> handleDeleteFunction(args));
+        r.register("decompile", "Decompile a function to C pseudocode", (b, args) -> handleDecompile(args));
+        r.register("list_strings", "List defined strings", (b, args) -> handleListStrings(args));
+        r.register("list_imports", "List imported (external) symbols", (b, args) -> handleListImports());
+        r.register("list_exports", "List exported entry points", (b, args) -> handleListExports());
+        r.register("memory_map", "List memory blocks (sections)", (b, args) -> handleMemoryMap());
+        r.register("xrefs_to", "References to an address", (b, args) -> handleXrefsTo(args));
+        r.register("xrefs_from", "References from an address", (b, args) -> handleXrefsFrom(args));
+        r.register("xrefs_list", "All cross references", (b, args) -> handleXrefsList(args));
+        r.register("import", "Import a binary into the project", (b, args) -> handleImport(args));
+        r.register("analyze", "Run auto-analysis on a program", (b, args) -> handleAnalyze(args));
+        r.register("list_programs", "List programs in the project", (b, args) -> handleListPrograms());
+        r.register("open_program", "Switch to a different program", (b, args) -> handleOpenProgram(args));
+        r.register("program_close", "Close (release) the current program",
+            (b, args) -> handleProgramClose());
+        r.register("program_delete", "Delete a program from the project", (b, args) -> handleProgramDelete(args));
+        r.register("program_export", "Export a program (binary or JSON)", (b, args) -> handleProgramExport(args));
+        r.register("find_string", "Search for a string value", (b, args) -> handleFindString(args));
+        r.register("find_bytes", "Search for a byte pattern", (b, args) -> handleFindBytes(args));
+        r.register("find_function", "Find functions by name or signature", (b, args) -> handleFindFunction(args));
+        r.register("find_calls", "Find call sites", (b, args) -> handleFindCalls(args));
+        r.register("find_crypto", "Find crypto-related functions", (b, args) -> handleFindCrypto());
+        r.register("find_interesting", "Find interesting functions (entry points, large, etc.)",
+            (b, args) -> handleFindInteresting());
+        r.register("symbol_list", "List symbols", (b, args) -> handleSymbolList(args));
+        r.register("symbol_get", "Look up a symbol by name or address", (b, args) -> handleSymbolGet(args));
+        r.register("symbol_create", "Create a label/symbol", (b, args) -> handleSymbolCreate(args));
+        r.register("symbol_delete", "Delete a symbol", (b, args) -> handleSymbolDelete(args));
+        r.register("symbol_rename", "Rename a symbol", (b, args) -> handleSymbolRename(args));
+        r.register("type_list", "List data types", (b, args) -> handleTypeList(args));
+        r.register("type_get", "Data type details (members)", (b, args) -> handleTypeGet(args));
+        r.register("type_create", "Create a struct/data type", (b, args) -> handleTypeCreate(args));
+        r.register("type_apply", "Apply a data type at an address", (b, args) -> handleTypeApply(args));
+        r.register("type_delete", "Delete a data type", (b, args) -> handleTypeDelete(args));
+        r.register("type_rename", "Rename a data type", (b, args) -> handleTypeRename(args));
+        r.register("type_create_enum", "Create an enum type", (b, args) -> handleTypeCreateEnum(args));
+        r.register("type_typedef", "Create a typedef", (b, args) -> handleTypeTypedef(args));
+        r.register("type_add_field", "Add a field to a struct", (b, args) -> handleTypeAddField(args));
+        r.register("type_del_field", "Remove a field from a struct", (b, args) -> handleTypeDelField(args));
+        r.register("tag_list", "List function tags", (b, args) -> handleTagList(args));
+        r.register("tag_get", "Tag details and the functions it is attached to", (b, args) -> handleTagGet(args));
+        r.register("tag_create", "Create a function tag", (b, args) -> handleTagCreate(args));
+        r.register("tag_delete", "Delete a function tag", (b, args) -> handleTagDelete(args));
+        r.register("tag_rename", "Rename a function tag", (b, args) -> handleTagRename(args));
+        r.register("tag_set_comment", "Set a function tag comment", (b, args) -> handleTagSetComment(args));
+        r.register("tag_add", "Attach a tag to a function", (b, args) -> handleTagAdd(args));
+        r.register("tag_remove", "Detach a tag from a function", (b, args) -> handleTagRemove(args));
+        r.register("function_set_signature", "Set a function signature",
+            (b, args) -> handleFunctionSetSignature(args));
+        r.register("function_set_return_type", "Set a function return type",
+            (b, args) -> handleFunctionSetReturnType(args));
+        r.register("function_set_calling_convention", "Set a function calling convention",
+            (b, args) -> handleFunctionSetCallingConvention(args));
+        r.register("set_var_type", "Set a local variable type", (b, args) -> handleSetVarType(args));
+        r.register("comment_list", "List comments", (b, args) -> handleCommentList(args));
+        r.register("comment_get", "Get a comment", (b, args) -> handleCommentGet(args));
+        r.register("comment_set", "Set a comment (pre/post/plate/repeatable)", (b, args) -> handleCommentSet(args));
+        r.register("comment_delete", "Delete a comment", (b, args) -> handleCommentDelete(args));
+        r.register("graph_calls", "Call graph (nodes + edges)", (b, args) -> handleGraphCalls(args));
+        r.register("graph_callers", "Recursive callers of a function", (b, args) -> handleGraphCallers(args));
+        r.register("graph_callees", "Recursive callees of a function", (b, args) -> handleGraphCallees(args));
+        r.register("graph_export", "Export the call graph", (b, args) -> handleGraphExport(args));
+        r.register("diff_programs", "BinDiff prep: export both programs to .BinExport for the native google/bindiff differ (CLI runs the differ and parses the .BinDiff DB)",
+                (b, args) -> handleDiffPrograms(args));
+        r.register("diff_functions", "Naive line diff of decompiled C, same program only (no alignment; not BinDiff)",
+                (b, args) -> handleDiffFunctions(args));
+        r.register("patch_bytes", "Patch bytes in memory", (b, args) -> handlePatchBytes(args));
+        r.register("patch_nop", "NOP out instructions", (b, args) -> handlePatchNop(args));
+        r.register("patch_export", "Export the patched binary", (b, args) -> handlePatchExport(args));
+        r.register("disasm", "Disassemble from an address", (b, args) -> handleDisasm(args));
+        r.register("find_constant", "Find constant references", (b, args) -> handleFindConstant(args));
+        r.register("decompile_multi", "Decompile several functions", (b, args) -> handleDecompileMulti(args));
+        r.register("find_instruction", "Find instructions by mnemonic", (b, args) -> handleFindInstruction(args));
+        r.register("functions_range", "List functions in an address range", (b, args) -> handleFunctionsRange(args));
+        r.register("defined_data", "List defined data items", (b, args) -> handleDefinedData(args));
+        r.register("stats", "Program statistics", (b, args) -> handleStats());
+        r.register("script_run", "Run a Ghidra script", (b, args) -> handleScriptRun(args));
+        r.register("script_java", "Run an inline Java snippet", (b, args) -> handleScriptJava(args));
+        r.register("script_python", "Run an inline Python snippet", (b, args) -> handleScriptPython(args));
+        r.register("script_list", "List available scripts", (b, args) -> handleScriptList());
+        r.register("batch", "Run a batch of commands", (b, args) -> handleBatch(args));
+        r.register("read_memory", "Read bytes from memory", (b, args) -> handleReadMemory(args));
+        return r;
+    }
 
     private static class JobTaskMonitor extends TaskMonitorAdapter {
         private volatile String message = "";
@@ -620,6 +773,7 @@ public class GhidraCliBridge extends GhidraScript {
             case "bridge_info":
             case "job_status":
             case "job_cancel":
+            case "help":
             case "shutdown":
                 return true;
             default:
@@ -645,6 +799,10 @@ public class GhidraCliBridge extends GhidraScript {
                 }
                 return new HandleResult(successResponse(result), false);
             }
+            case "help":
+                // Additive command: lists every registered bridge command so
+                // clients can discover the supported set at runtime.
+                return new HandleResult(successResponse(registry.help()), false);
             case "shutdown": {
                 beginShutdown();
                 JsonObject response = new JsonObject();
@@ -676,100 +834,34 @@ public class GhidraCliBridge extends GhidraScript {
 
     private JsonObject dispatchCommand(String command, JsonObject args) {
         if (command == null) return null;
-        switch (command) {
-            case "program_info":    return handleProgramInfo();
-            case "list_functions":  return handleListFunctions(args);
-            case "get_function":    return handleGetFunction(args);
-            case "rename_function": return handleRenameFunction(args);
-            case "create_function": return handleCreateFunction(args);
-            case "delete_function": return handleDeleteFunction(args);
-            case "decompile":       return handleDecompile(args);
-            case "list_strings":    return handleListStrings(args);
-            case "list_imports":    return handleListImports();
-            case "list_exports":    return handleListExports();
-            case "memory_map":      return handleMemoryMap();
-            case "xrefs_to":        return handleXrefsTo(args);
-            case "xrefs_from":      return handleXrefsFrom(args);
-            case "xrefs_list":      return handleXrefsList(args);
-            case "import":          return handleImport(args);
-            case "analyze":         return handleAnalyze(args);
-            case "list_programs":   return handleListPrograms();
-            case "open_program":    return handleOpenProgram(args);
-            case "program_close":   return handleProgramClose();
-            case "program_delete":  return handleProgramDelete(args);
-            case "program_export":  return handleProgramExport(args);
-            // Find commands
-            case "find_string":     return handleFindString(args);
-            case "find_bytes":      return handleFindBytes(args);
-            case "find_function":   return handleFindFunction(args);
-            case "find_calls":      return handleFindCalls(args);
-            case "find_crypto":     return handleFindCrypto();
-            case "find_interesting": return handleFindInteresting();
-            // Symbol commands
-            case "symbol_list":     return handleSymbolList(args);
-            case "symbol_get":      return handleSymbolGet(args);
-            case "symbol_create":   return handleSymbolCreate(args);
-            case "symbol_delete":   return handleSymbolDelete(args);
-            case "symbol_rename":   return handleSymbolRename(args);
-            // Type commands
-            case "type_list":       return handleTypeList(args);
-            case "type_get":        return handleTypeGet(args);
-            case "type_create":     return handleTypeCreate(args);
-            case "type_apply":      return handleTypeApply(args);
-            case "type_delete":     return handleTypeDelete(args);
-            case "type_rename":     return handleTypeRename(args);
-            case "type_create_enum": return handleTypeCreateEnum(args);
-            case "type_typedef":    return handleTypeTypedef(args);
-            case "type_add_field":  return handleTypeAddField(args);
-            case "type_del_field":  return handleTypeDelField(args);
-            // Tag commands
-            case "tag_list":        return handleTagList(args);
-            case "tag_get":         return handleTagGet(args);
-            case "tag_create":      return handleTagCreate(args);
-            case "tag_delete":      return handleTagDelete(args);
-            case "tag_rename":      return handleTagRename(args);
-            case "tag_set_comment": return handleTagSetComment(args);
-            case "tag_add":         return handleTagAdd(args);
-            case "tag_remove":      return handleTagRemove(args);
-            // Function signature commands
-            case "function_set_signature": return handleFunctionSetSignature(args);
-            case "function_set_return_type": return handleFunctionSetReturnType(args);
-            case "function_set_calling_convention": return handleFunctionSetCallingConvention(args);
-            case "set_var_type":    return handleSetVarType(args);
-            // Comment commands
-            case "comment_list":    return handleCommentList(args);
-            case "comment_get":     return handleCommentGet(args);
-            case "comment_set":     return handleCommentSet(args);
-            case "comment_delete":  return handleCommentDelete(args);
-            // Graph commands
-            case "graph_calls":     return handleGraphCalls(args);
-            case "graph_callers":   return handleGraphCallers(args);
-            case "graph_callees":   return handleGraphCallees(args);
-            case "graph_export":    return handleGraphExport(args);
-            // Diff commands
-            case "diff_programs":   return handleDiffPrograms(args);
-            case "diff_functions":  return handleDiffFunctions(args);
-            // Patch commands
-            case "patch_bytes":     return handlePatchBytes(args);
-            case "patch_nop":       return handlePatchNop(args);
-            case "patch_export":    return handlePatchExport(args);
-            // Other commands
-            case "disasm":          return handleDisasm(args);
-            case "stats":           return handleStats();
-            // Script commands
-            case "script_run":      return handleScriptRun(args);
-            case "script_java":     return handleScriptJava(args);
-            case "script_python":   return handleScriptPython(args);
-            case "script_list":     return handleScriptList();
-            // Batch
-            case "batch":           return handleBatch(args);
-            // Memory read
-            case "read_memory":     return handleReadMemory(args);
-            default:                return null;
-        }
+        return registry.dispatch(this, command, args);
     }
 
+
     // --- Response Helpers ---
+
+    /**
+     * Central "no program loaded" guard. Handlers wrap their body in this so
+     * the guard reads once instead of being copy-pasted into 70 handlers.
+     * The body is evaluated lazily: with no program open, it never runs.
+     */
+    private JsonObject requireProgram(Supplier<JsonObject> body) {
+        if (currentProgram == null) {
+            return errorResult("No program loaded");
+        }
+        return body.get();
+    }
+
+    /**
+     * Finish a list envelope: `count` is always rows.size(), so every
+     * list-shaped response has the same {key: rows, count: N} contract that
+     * the CLI's ENVELOPES table (query/mod.rs) relies on.
+     */
+    private JsonObject listResponse(JsonObject result, String key, JsonArray rows) {
+        result.add(key, rows);
+        result.addProperty("count", rows.size());
+        return result;
+    }
 
     private JsonObject successResponse(JsonObject data) {
         JsonObject resp = new JsonObject();
@@ -1123,9 +1215,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleProgramInfo() {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         JsonObject result = new JsonObject();
         result.addProperty("name", currentProgram.getName());
@@ -1143,17 +1233,17 @@ public class GhidraCliBridge extends GhidraScript {
         result.addProperty("max_address", currentProgram.getMaxAddress().toString());
 
         FunctionManager fm = currentProgram.getFunctionManager();
-        result.addProperty("function_count", fm.getFunctionCount());
+        result.addProperty("function_count", countPrimaryFunctions(fm));
 
         return result;
+        });
     }
 
     private JsonObject handleListFunctions(JsonObject args) {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         int limit = getArgInt(args, "limit", 0);
+        int offset = getArgInt(args, "offset", 0);
         String nameFilter = getArgString(args, "filter");
         String[] tagFilterNames = getArgStringArray(args, "tags");
         boolean untagged = getArgBool(args, "untagged", false);
@@ -1174,6 +1264,7 @@ public class GhidraCliBridge extends GhidraScript {
 
         JsonArray functions = new JsonArray();
         int count = 0;
+        int matched = 0;
 
         FunctionIterator iter = fm.getFunctions(true);
         while (iter.hasNext()) {
@@ -1191,6 +1282,9 @@ public class GhidraCliBridge extends GhidraScript {
             if (untagged && !func.getTags().isEmpty()) {
                 continue;
             }
+
+            matched++;
+            if (matched <= offset) continue;
 
             JsonObject funcData = new JsonObject();
             funcData.addProperty("name", name);
@@ -1225,9 +1319,8 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("functions", functions);
-        result.addProperty("count", functions.size());
-        return result;
+        return listResponse(result, "functions", functions);
+        });
     }
 
     private JsonObject functionToJson(Function func) {
@@ -1329,7 +1422,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleGetFunction(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String target = getArgString(args, "address");
         if (target == null || target.isEmpty()) {
@@ -1346,10 +1439,11 @@ public class GhidraCliBridge extends GhidraScript {
             return errorResult("No function at target " + target + ". Try: ghidra function list --filter " + target);
         }
         return functionToJson(func);
+        });
     }
 
     private JsonObject handleRenameFunction(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String oldTarget = getArgString(args, "old_name");
         String newName = getArgString(args, "new_name");
@@ -1382,10 +1476,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to rename function: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleCreateFunction(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String target = getArgString(args, "address");
         String requestedName = getArgString(args, "name");
@@ -1429,10 +1524,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to create function: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleDeleteFunction(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String target = getArgString(args, "address");
         if (target == null || target.isEmpty()) {
@@ -1465,12 +1561,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to delete function: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleDecompile(JsonObject args) {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         String addrStr = getArgString(args, "address");
         if (addrStr == null || addrStr.isEmpty()) {
@@ -1584,20 +1679,21 @@ public class GhidraCliBridge extends GhidraScript {
         } finally {
             decompiler.dispose();
         }
+        });
     }
 
     private JsonObject handleListStrings(JsonObject args) {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         int limit = getArgInt(args, "limit", 0);
+        int offset = getArgInt(args, "offset", 0);
         String nameFilter = getArgString(args, "filter");
 
         JsonArray strings = new JsonArray();
         Listing listing = currentProgram.getListing();
         DataIterator dataIter = listing.getDefinedData(true);
         int count = 0;
+        int matched = 0;
 
         while (dataIter.hasNext()) {
             if (limit > 0 && count >= limit) break;
@@ -1610,6 +1706,9 @@ public class GhidraCliBridge extends GhidraScript {
                     if (nameFilter != null && !val.toLowerCase().contains(nameFilter.toLowerCase())) {
                         continue;
                     }
+
+                    matched++;
+                    if (matched <= offset) continue;
 
                     JsonObject strData = new JsonObject();
                     strData.addProperty("address", data.getAddress().toString());
@@ -1624,15 +1723,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("strings", strings);
-        result.addProperty("count", strings.size());
-        return result;
+        return listResponse(result, "strings", strings);
+        });
     }
 
     private JsonObject handleListImports() {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         JsonArray imports = new JsonArray();
         SymbolTable symbolTable = currentProgram.getSymbolTable();
@@ -1652,15 +1748,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("imports", imports);
-        result.addProperty("count", imports.size());
-        return result;
+        return listResponse(result, "imports", imports);
+        });
     }
 
     private JsonObject handleListExports() {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         JsonArray exports = new JsonArray();
         SymbolTable symbolTable = currentProgram.getSymbolTable();
@@ -1677,15 +1770,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("exports", exports);
-        result.addProperty("count", exports.size());
-        return result;
+        return listResponse(result, "exports", exports);
+        });
     }
 
     private JsonObject handleMemoryMap() {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         JsonArray blocks = new JsonArray();
         Memory memory = currentProgram.getMemory();
@@ -1708,15 +1798,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("blocks", blocks);
-        result.addProperty("count", blocks.size());
-        return result;
+        return listResponse(result, "blocks", blocks);
+        });
     }
 
     private JsonObject handleXrefsTo(JsonObject args) {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         String addrStr = getArgString(args, "address");
         if (addrStr == null || addrStr.isEmpty()) {
@@ -1755,15 +1842,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("xrefs", xrefs);
-        result.addProperty("count", xrefs.size());
-        return result;
+        return listResponse(result, "xrefs", xrefs);
+        });
     }
 
     private JsonObject handleXrefsFrom(JsonObject args) {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         String addrStr = getArgString(args, "address");
         if (addrStr == null || addrStr.isEmpty()) {
@@ -1831,15 +1915,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("xrefs", xrefs);
-        result.addProperty("count", xrefs.size());
-        return result;
+        return listResponse(result, "xrefs", xrefs);
+        });
     }
 
     private JsonObject handleXrefsList(JsonObject args) {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         String addrStr = getArgString(args, "address");
         if (addrStr == null || addrStr.isEmpty()) {
@@ -1933,9 +2014,8 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("xrefs", xrefs);
-        result.addProperty("count", xrefs.size());
-        return result;
+        return listResponse(result, "xrefs", xrefs);
+        });
     }
 
     private JsonObject handleImport(JsonObject args) {
@@ -1973,23 +2053,55 @@ public class GhidraCliBridge extends GhidraScript {
                 return errorResult("Failed to import binary");
             }
 
-            // Save and release - loadResults is a LoadResults<Program>
-            // Use reflection to handle API differences across Ghidra versions
+            // Fail fast on a name collision before saving anything.
+            if (programName != null && !programName.isEmpty()
+                    && !programName.equals(binaryFile.getName())
+                    && project.getProjectData().getFile("/" + programName) != null) {
+                return errorResult("A program named '" + programName
+                        + "' already exists in the project");
+            }
+
+            // Save - per-loaded item (reflection: LoadResults is Iterable<Loaded<DomainObject>>)
             try {
-                java.lang.reflect.Method saveMethod = loadResults.getClass().getMethod("save", TaskMonitor.class);
-                // Actually it's per-loaded item; iterate
-                // LoadResults implements Iterable<Loaded<DomainObject>>
                 if (loadResults instanceof Iterable) {
                     for (Object loaded : (Iterable<?>) loadResults) {
                         java.lang.reflect.Method saveMeth = loaded.getClass().getMethod("save", TaskMonitor.class);
                         saveMeth.invoke(loaded, mon);
                     }
                 }
+            } catch (Exception reflectEx) {
+                printerr("Import save warning: " + reflectEx.getMessage());
+            }
+
+            // Release the loaded handles BEFORE the rename: DomainFile refuses
+            // to rename/delete a file whose domain object is open in this
+            // session ("is in use"), so the handle must go first.
+            try {
                 java.lang.reflect.Method releaseMethod = loadResults.getClass().getMethod("release", Object.class);
                 releaseMethod.invoke(loadResults, consumer);
             } catch (Exception reflectEx) {
-                // Fallback: try direct cast for older APIs
-                printerr("Import save warning: " + reflectEx.getMessage());
+                printerr("Import release warning: " + reflectEx.getMessage());
+            }
+
+            // AutoImporter always names the new program after the binary's file
+            // name; rename it to the requested --program name, which is what
+            // clients use with open_program afterwards. Failures here are
+            // errors, not warnings: the caller will look for the program under
+            // the requested name.
+            if (programName != null && !programName.isEmpty()
+                    && !programName.equals(binaryFile.getName())) {
+                DomainFile target = project.getProjectData().getFile("/" + binaryFile.getName());
+                if (target == null) {
+                    return errorResult("Imported program not found in project (expected: "
+                            + binaryFile.getName() + ")");
+                }
+                try {
+                    target.setName(programName);
+                } catch (Exception renameEx) {
+                    return errorResult("Import succeeded as '" + binaryFile.getName()
+                            + "' but rename to '" + programName + "' failed: "
+                            + renameEx.getMessage());
+                }
             }
 
             JsonObject result = new JsonObject();
@@ -2028,8 +2140,32 @@ public class GhidraCliBridge extends GhidraScript {
         try {
             TaskMonitor mon = monitor;
 
-            // Use GhidraScript's built-in analyzeAll which works across Ghidra versions
-            analyzeAll(currentProgram);
+            // Force a full analysis, mirroring what HeadlessAnalyzer does for
+            // `-process` (initializeOptions -> reAnalyzeAll -> startAnalysis
+            // inside a transaction, then mark analyzed). The script-level
+            // analyzeAll() alone is unreliable here: AutoAnalysisManager
+            // startAnalysis() silently no-ops while another analysis thread
+            // is active (e.g. the auto-analysis Ghidra kicks off when a
+            // program domain is opened), which leaves in-bridge imports in a
+            // symbol-only state - no instructions, no xrefs, no PLT/external
+            // functions. So: wait for any in-flight analysis to finish first,
+            // then re-analyze deterministically.
+            AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(currentProgram);
+            mgr.initializeOptions();
+            if (mgr.isAnalyzing()) {
+                mgr.waitForAnalysis(null, mon);
+            }
+            int txId = currentProgram.startTransaction("Analysis");
+            try {
+                // Note (from HeadlessAnalyzer): analyze regardless of whether
+                // the program was already analyzed (user/import state may be
+                // partial or stale).
+                mgr.reAnalyzeAll(null);
+                mgr.startAnalysis(mon); // synchronous "kick start"
+            } finally {
+                currentProgram.endTransaction(txId, true);
+            }
+            GhidraProgramUtilities.markProgramAnalyzed(currentProgram);
 
             // Save the analyzed program. The bridge opens the program in
             // `-process` mode against a project created by a clean one-shot
@@ -2044,7 +2180,7 @@ public class GhidraCliBridge extends GhidraScript {
             JsonObject result = new JsonObject();
             result.addProperty("status", "success");
             result.addProperty("program", programName);
-            result.addProperty("function_count", fm.getFunctionCount());
+            result.addProperty("function_count", countPrimaryFunctions(fm));
             return result;
 
         } catch (Exception e) {
@@ -2078,7 +2214,7 @@ public class GhidraCliBridge extends GhidraScript {
                 if (isCurrent && currentProgram != null) {
                     // For current program, use live data
                     FunctionManager fm = currentProgram.getFunctionManager();
-                    int funcCount = fm.getFunctionCount();
+                    int funcCount = countPrimaryFunctions(fm);
                     prog.addProperty("function_count", funcCount);
                     prog.addProperty("analyzed", funcCount > 1);
                     prog.addProperty("executable_format", currentProgram.getExecutableFormat());
@@ -2205,9 +2341,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleProgramClose() {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         String programName = currentProgram.getName();
 
@@ -2227,6 +2361,7 @@ public class GhidraCliBridge extends GhidraScript {
         result.addProperty("status", "closed");
         result.addProperty("program", programName);
         return result;
+        });
     }
 
     private JsonObject handleProgramDelete(JsonObject args) {
@@ -2241,6 +2376,20 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         try {
+            // An open file cannot be deleted ("is in use"): release the target
+            // if the bridge has it open as the current program. (We do not
+            // release other open programs on the user's behalf — that would
+            // silently close their working program. Files left open by a
+            // headless session restore must be closed with `gd program close`.)
+            if (currentProgram != null && currentProgram.getName().equals(programName)) {
+                try {
+                    currentProgram.release(project);
+                } catch (Exception e) {
+                    // Best effort; delete below surfaces the real error
+                }
+                currentProgram = null;
+            }
+
             ProjectData projectData = project.getProjectData();
             String path = programName.startsWith("/") ? programName : "/" + programName;
             DomainFile programFile = projectData.getFile(path);
@@ -2249,7 +2398,13 @@ public class GhidraCliBridge extends GhidraScript {
                 return errorResult("Program not found: " + programName);
             }
 
-            programFile.delete();
+            try {
+                programFile.delete();
+            } catch (Exception e) {
+                return errorResult("Failed to delete program: " + e.getMessage()
+                        + " (if it is open, close it first: gd program close --program "
+                        + programName + ")");
+            }
 
             JsonObject result = new JsonObject();
             result.addProperty("status", "deleted");
@@ -2262,9 +2417,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleProgramExport(JsonObject args) {
-        if (currentProgram == null) {
-            return errorResult("No program loaded");
-        }
+        return requireProgram(() -> {
 
         String exportFormat = getArgString(args, "format");
         if (exportFormat == null) exportFormat = "json";
@@ -2364,6 +2517,7 @@ public class GhidraCliBridge extends GhidraScript {
                 return errorResult("Failed to export (" + exportFormat + "): " + e.getMessage());
             }
         }
+        });
     }
 
     // ================================================================
@@ -2373,7 +2527,7 @@ public class GhidraCliBridge extends GhidraScript {
     // --- Find Handlers ---
 
     private JsonObject handleFindString(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String pattern = getArgString(args, "pattern");
         if (pattern == null) pattern = "";
@@ -2442,12 +2596,11 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             JsonObject result = new JsonObject();
-            result.add("results", results);
-            result.addProperty("count", results.size());
-            return result;
+            return listResponse(result, "results", results);
         } catch (Exception e) {
             return errorResult("Failed to find strings: " + e.getMessage());
         }
+        });
     }
 
     /**
@@ -2495,7 +2648,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleFindBytes(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String hexPattern = getArgString(args, "hex");
         if (hexPattern == null || hexPattern.isEmpty()) {
@@ -2523,16 +2676,15 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             JsonObject result = new JsonObject();
-            result.add("results", results);
-            result.addProperty("count", results.size());
-            return result;
+            return listResponse(result, "results", results);
         } catch (Exception e) {
             return errorResult("Failed to find bytes: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleFindFunction(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String pattern = getArgString(args, "pattern");
         if (pattern == null) pattern = "";
@@ -2566,16 +2718,15 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             JsonObject result = new JsonObject();
-            result.add("results", results);
-            result.addProperty("count", results.size());
-            return result;
+            return listResponse(result, "results", results);
         } catch (Exception e) {
             return errorResult("Failed to find functions: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleFindCalls(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String functionTarget = getArgString(args, "function");
         if (functionTarget == null || functionTarget.isEmpty()) {
@@ -2614,10 +2765,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to find calls: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleFindCrypto() {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         try {
             Memory memory = currentProgram.getMemory();
@@ -2649,16 +2801,15 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             JsonObject result = new JsonObject();
-            result.add("results", results);
-            result.addProperty("count", results.size());
-            return result;
+            return listResponse(result, "results", results);
         } catch (Exception e) {
             return errorResult("Failed to find crypto: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleFindInteresting() {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         try {
             FunctionManager fm = currentProgram.getFunctionManager();
@@ -2722,19 +2873,22 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to find interesting functions: " + e.getMessage());
         }
+        });
     }
 
     // --- Symbol Handlers ---
 
     private JsonObject handleSymbolList(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         int limit = getArgInt(args, "limit", 0);
+        int offset = getArgInt(args, "offset", 0);
         String nameFilter = getArgString(args, "filter");
 
         SymbolTable symbolTable = currentProgram.getSymbolTable();
         JsonArray symbols = new JsonArray();
         int count = 0;
+        int matched = 0;
 
         SymbolIterator symIter = symbolTable.getAllSymbols(true);
         while (symIter.hasNext()) {
@@ -2747,6 +2901,9 @@ public class GhidraCliBridge extends GhidraScript {
                 continue;
             }
 
+            matched++;
+            if (matched <= offset) continue;
+
             JsonObject symData = new JsonObject();
             symData.addProperty("name", name);
             symData.addProperty("address", symbol.getAddress().toString());
@@ -2758,13 +2915,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("symbols", symbols);
-        result.addProperty("count", symbols.size());
-        return result;
+        return listResponse(result, "symbols", symbols);
+        });
     }
 
     private JsonObject handleSymbolGet(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressOrName = getArgString(args, "name");
         if (addressOrName == null || addressOrName.isEmpty()) {
@@ -2823,10 +2979,11 @@ public class GhidraCliBridge extends GhidraScript {
         JsonObject result = new JsonObject();
         result.add("symbols", syms);
         return result;
+        });
     }
 
     private JsonObject handleSymbolCreate(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressStr = getArgString(args, "address");
         String name = getArgString(args, "name");
@@ -2856,10 +3013,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to create symbol: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleSymbolDelete(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String name = getArgString(args, "name");
         if (name == null) return errorResult("Symbol name required");
@@ -2894,10 +3052,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to delete symbol: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleSymbolRename(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String oldName = getArgString(args, "old_name");
         String newName = getArgString(args, "new_name");
@@ -2936,20 +3095,23 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to rename symbol: " + e.getMessage());
         }
+        });
     }
 
     // --- Type Handlers ---
 
     private JsonObject handleTypeList(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         int limit = getArgInt(args, "limit", 0);
+        int offset = getArgInt(args, "offset", 0);
         String nameFilter = getArgString(args, "filter");
         DataTypeManager dtm = currentProgram.getDataTypeManager();
         JsonArray types = new JsonArray();
 
         Iterator<DataType> dtIter = dtm.getAllDataTypes();
         int count = 0;
+        int matched = 0;
         while (dtIter.hasNext()) {
             DataType dt = dtIter.next();
             if (limit > 0 && count >= limit) break;
@@ -2957,6 +3119,9 @@ public class GhidraCliBridge extends GhidraScript {
             if (nameFilter != null && !dt.getName().toLowerCase().contains(nameFilter.toLowerCase())) {
                 continue;
             }
+
+            matched++;
+            if (matched <= offset) continue;
 
             JsonObject typeData = new JsonObject();
             typeData.addProperty("name", dt.getName());
@@ -2978,13 +3143,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("types", types);
-        result.addProperty("count", types.size());
-        return result;
+        return listResponse(result, "types", types);
+        });
     }
 
     private JsonObject handleTypeGet(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String typeName = getArgString(args, "name");
         if (typeName == null) return errorResult("Type name required");
@@ -3054,10 +3218,11 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         return typeInfo;
+        });
     }
 
     private JsonObject handleTypeCreate(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String typeName = getArgString(args, "definition");
         if (typeName == null) typeName = getArgString(args, "name");
@@ -3082,10 +3247,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to create type: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTypeApply(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressStr = getArgString(args, "address");
         String typeName = getArgString(args, "type_name");
@@ -3120,6 +3286,7 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to apply type: " + e.getMessage());
         }
+        });
     }
 
     private DataType resolveDataType(String name) {
@@ -3144,7 +3311,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleTypeDelete(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String typeName = getArgString(args, "name");
         if (typeName == null || typeName.isEmpty()) return errorResult("Type name required");
 
@@ -3174,10 +3341,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to delete type: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTypeRename(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String oldName = getArgString(args, "old_name");
         String newName = getArgString(args, "new_name");
         if (oldName == null || oldName.isEmpty()) return errorResult("Old type name required");
@@ -3205,10 +3373,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to rename type: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTypeCreateEnum(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String name = getArgString(args, "name");
         String valuesStr = getArgString(args, "values");
         int size = getArgInt(args, "size", 4);
@@ -3247,10 +3416,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to create enum: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTypeTypedef(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String name = getArgString(args, "name");
         String baseTypeName = getArgString(args, "base_type");
         if (name == null || baseTypeName == null) return errorResult("name and base_type required");
@@ -3279,10 +3449,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to create typedef: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTypeAddField(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String typeName = getArgString(args, "type_name");
         String fieldName = getArgString(args, "field_name");
         String fieldTypeName = getArgString(args, "field_type");
@@ -3323,10 +3494,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to add field: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTypeDelField(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String typeName = getArgString(args, "type_name");
         String fieldName = getArgString(args, "field_name");
         if (typeName == null || fieldName == null)
@@ -3366,6 +3538,7 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to delete field: " + e.getMessage());
         }
+        });
     }
 
     // --- Function Tag Handlers ---
@@ -3428,7 +3601,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleTagList(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         int limit = getArgInt(args, "limit", 0);
         String funcTarget = getArgString(args, "function");
         FunctionTagManager tm = currentProgram.getFunctionManager().getFunctionTagManager();
@@ -3451,13 +3624,12 @@ public class GhidraCliBridge extends GhidraScript {
             tags.add(tagToJson(t, tm));
         }
         JsonObject result = new JsonObject();
-        result.add("tags", tags);
-        result.addProperty("count", tags.size());
-        return result;
+        return listResponse(result, "tags", tags);
+        });
     }
 
     private JsonObject handleTagGet(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String name = getArgString(args, "name");
         if (name == null || name.isEmpty()) return errorResult("Tag name required");
         int limit = getArgInt(args, "limit", 0);
@@ -3487,13 +3659,12 @@ public class GhidraCliBridge extends GhidraScript {
         // (comment/use_count live in tag_list).
         JsonObject result = new JsonObject();
         result.addProperty("target", name);
-        result.add("functions", functions);
-        result.addProperty("count", functions.size());
-        return result;
+        return listResponse(result, "functions", functions);
+        });
     }
 
     private JsonObject handleTagCreate(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String name = getArgString(args, "name");
         String comment = getArgString(args, "comment");
         if (name == null) return errorResult("Tag name required");
@@ -3532,10 +3703,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to create tag: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTagDelete(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String name = getArgString(args, "name");
         if (name == null || name.isEmpty()) return errorResult("Tag name required");
 
@@ -3574,10 +3746,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to delete tag: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTagRename(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String name = getArgString(args, "name");
         String newName = getArgString(args, "new_name");
         if (name == null || newName == null || name.isEmpty())
@@ -3612,10 +3785,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to rename tag: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTagSetComment(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String name = getArgString(args, "name");
         String comment = getArgString(args, "comment");
         if (name == null || name.isEmpty()) return errorResult("Tag name required");
@@ -3642,10 +3816,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to set tag comment: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTagAdd(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String target = getArgString(args, "function");
         String[] rawTags = getArgStringArray(args, "tags");
         boolean noCreate = getArgBool(args, "no_create", false);
@@ -3698,10 +3873,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to add tags: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleTagRemove(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String target = getArgString(args, "function");
         String[] rawTags = getArgStringArray(args, "tags");
         boolean all = getArgBool(args, "all", false);
@@ -3749,10 +3925,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to remove tags: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleFunctionSetSignature(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String target = getArgString(args, "target");
         String sigStr = getArgString(args, "signature");
         if (target == null || sigStr == null) return errorResult("target and signature required");
@@ -3799,10 +3976,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to set signature: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleFunctionSetReturnType(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String target = getArgString(args, "target");
         String returnTypeName = getArgString(args, "return_type");
         if (target == null || returnTypeName == null)
@@ -3837,10 +4015,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to set return type: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleFunctionSetCallingConvention(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String target = getArgString(args, "target");
         String convention = getArgString(args, "convention");
         if (target == null || convention == null)
@@ -3871,10 +4050,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to set calling convention: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleSetVarType(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
         String funcTarget = getArgString(args, "function");
         String varName = getArgString(args, "var_name");
         String typeName = getArgString(args, "type_name");
@@ -3937,6 +4117,7 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to set variable type: " + e.getMessage());
         }
+        });
     }
 
     // --- Comment Handlers ---
@@ -3952,15 +4133,17 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleCommentList(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         int limit = getArgInt(args, "limit", 0);
+        int offset = getArgInt(args, "offset", 0);
         String nameFilter = getArgString(args, "filter");
 
         Listing listing = currentProgram.getListing();
         Memory memory = currentProgram.getMemory();
         JsonArray comments = new JsonArray();
         int count = 0;
+        int matched = 0;
 
         int[][] commentTypes = {
             {CodeUnit.EOL_COMMENT},
@@ -3995,6 +4178,9 @@ public class GhidraCliBridge extends GhidraScript {
                             continue;
                         }
 
+                        matched++;
+                        if (matched <= offset) continue;
+
                         JsonObject commentObj = new JsonObject();
                         commentObj.addProperty("address", addr.toString());
                         commentObj.addProperty("type", commentNames[i]);
@@ -4007,13 +4193,12 @@ public class GhidraCliBridge extends GhidraScript {
         }
 
         JsonObject result = new JsonObject();
-        result.add("comments", comments);
-        result.addProperty("count", comments.size());
-        return result;
+        return listResponse(result, "comments", comments);
+        });
     }
 
     private JsonObject handleCommentGet(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressStr = getArgString(args, "address");
         if (addressStr == null) return errorResult("Address required");
@@ -4047,10 +4232,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to get comments: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleCommentSet(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressStr = getArgString(args, "address");
         String text = getArgString(args, "text");
@@ -4089,10 +4275,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to set comment: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handleCommentDelete(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressStr = getArgString(args, "address");
         if (addressStr == null) return errorResult("Address required");
@@ -4122,12 +4309,13 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to delete comment: " + e.getMessage());
         }
+        });
     }
 
     // --- Graph Handlers ---
 
     private JsonObject handleGraphCalls(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         int limit = getArgInt(args, "limit", 0);
 
@@ -4176,6 +4364,7 @@ public class GhidraCliBridge extends GhidraScript {
         result.addProperty("node_count", nodes.size());
         result.addProperty("edge_count", edges.size());
         return result;
+        });
     }
 
     private Function findFunctionByNameOrAddress(String nameOrAddr) {
@@ -4204,7 +4393,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleGraphCallers(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String funcName = getArgString(args, "function");
         if (funcName == null) return errorResult("Function name required");
@@ -4222,9 +4411,8 @@ public class GhidraCliBridge extends GhidraScript {
 
         JsonObject result = new JsonObject();
         result.addProperty("function", funcName);
-        result.add("callers", callers);
-        result.addProperty("count", callers.size());
-        return result;
+        return listResponse(result, "callers", callers);
+        });
     }
 
     private void findCallersRecursive(Function func, int currentDepth, int maxDepth,
@@ -4255,7 +4443,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleGraphCallees(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String funcName = getArgString(args, "function");
         if (funcName == null) return errorResult("Function name required");
@@ -4273,9 +4461,8 @@ public class GhidraCliBridge extends GhidraScript {
 
         JsonObject result = new JsonObject();
         result.addProperty("function", funcName);
-        result.add("callees", callees);
-        result.addProperty("count", callees.size());
-        return result;
+        return listResponse(result, "callees", callees);
+        });
     }
 
     private void findCalleesRecursive(Function func, int currentDepth, int maxDepth,
@@ -4311,7 +4498,7 @@ public class GhidraCliBridge extends GhidraScript {
     }
 
     private JsonObject handleGraphExport(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String format = getArgString(args, "format");
         if (format == null) format = "json";
@@ -4353,57 +4540,256 @@ public class GhidraCliBridge extends GhidraScript {
         } else {
             return errorResult("Unsupported format: " + format);
         }
+        });
     }
 
     // --- Diff Handlers ---
 
     private JsonObject handleDiffPrograms(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        // BinDiff prep: export both programs to .BinExport so the CLI can
+        // run the native google/bindiff differ on them (src/bindiff.rs).
+        // The exporter is loaded at runtime from the plain jar the CLI
+        // passes — Ghidra's script compiler cannot see script-dir jars
+        // (same trick as re/ghidra-scripts/binexport/ExportBE.java).
+        String prog1Name = getArgString(args, "program1");
+        String prog2Name = getArgString(args, "program2");
+        String jarPath = getArgString(args, "binexport_jar");
 
-        String prog1 = getArgString(args, "program1");
-        String prog2 = getArgString(args, "program2");
-        if (prog1 == null) prog1 = "";
-        if (prog2 == null) prog2 = "";
+        if (prog2Name == null || prog2Name.isEmpty()) {
+            return errorResult("program2 is required: gd diff programs [PROG1] PROG2");
+        }
+
+        // program1 defaults to the loaded program; a name opens it from the
+        // project (read-only, closed afterwards).
+        Program p1 = currentProgram;
+        boolean p1Opened = false;
+        if (p1 == null) {
+            if (prog1Name == null || prog1Name.isEmpty()) {
+                return errorResult("No program loaded and no program1 given: pass PROG1 or use --program. Available programs: "
+                    + availableProgramNames());
+            }
+            p1 = openProjectProgram(prog1Name);
+            if (p1 == null) {
+                return errorResult("program1 not found in project: " + prog1Name
+                    + ". Available programs: " + availableProgramNames());
+            }
+            p1Opened = true;
+        } else if (prog1Name != null && !prog1Name.isEmpty() && !prog1Name.equals(p1.getName())) {
+            Program named = openProjectProgram(prog1Name);
+            if (named == null) {
+                return errorResult("program1 not found in project: " + prog1Name
+                    + ". Available programs: " + availableProgramNames());
+            }
+            p1 = named;
+            p1Opened = true;
+        }
+
+        if (prog2Name.equals(p1.getName())) {
+            return errorResult("program1 and program2 must be different programs (both resolve to \"" + p1.getName() + "\")");
+        }
+        Program p2 = openProjectProgram(prog2Name);
+        if (p2 == null) {
+            return errorResult("program2 not found in project: " + prog2Name
+                + ". Available programs: " + availableProgramNames());
+        }
+
+        if (jarPath == null || jarPath.isEmpty()) {
+            return errorResult("BinDiff is not configured: set bindiff.binexport_jar in the ghidra-cli config to the plain (non-OSGi) BinExport.jar");
+        }
+        File jarFileObj = new File(jarPath);
+        if (!jarFileObj.isFile()) {
+            return errorResult("BinExport jar not found: " + jarPath + " (fix bindiff.binexport_jar in the ghidra-cli config)");
+        }
 
         try {
-            FunctionManager fm = currentProgram.getFunctionManager();
-            Memory memory = currentProgram.getMemory();
-            SymbolTable symbolTable = currentProgram.getSymbolTable();
+            // Fresh temp dir: the export names determine the differ's output
+            // name (<p1>_vs_<p2>.BinDiff).
+            File out1;
+            File out2;
+            try {
+                File dir = File.createTempFile("gd-bindiff-", "");
+                dir.delete();
+                dir.mkdirs();
+                out1 = new File(dir, p1.getName() + ".BinExport");
+                out2 = new File(dir, p2.getName() + ".BinExport");
 
-            JsonObject prog1Stats = new JsonObject();
-            prog1Stats.addProperty("name", prog1);
-            prog1Stats.addProperty("function_count", fm.getFunctionCount());
-            prog1Stats.addProperty("memory_size", memory.getSize());
-            prog1Stats.addProperty("symbol_count", symbolTable.getNumSymbols());
-
-            JsonArray memBlocks = new JsonArray();
-            for (MemoryBlock block : memory.getBlocks()) {
-                JsonObject blockObj = new JsonObject();
-                blockObj.addProperty("name", block.getName());
-                blockObj.addProperty("start", block.getStart().toString());
-                blockObj.addProperty("end", block.getEnd().toString());
-                blockObj.addProperty("size", block.getSize());
-                memBlocks.add(blockObj);
+                JarFile jarFile = new JarFile(jarFileObj);
+                try {
+                    ClassLoader loader = new BinExportExporterLoader(GhidraScript.class.getClassLoader(), jarFile);
+                    Class<?> exporter = loader.loadClass("com.google.security.binexport.BinExportExporter");
+                    Object inst = exporter.getDeclaredConstructor().newInstance();
+                    java.lang.reflect.Method m = exporter.getMethod("export", File.class, DomainObject.class,
+                        AddressSetView.class, TaskMonitor.class);
+                    if (monitor.isCancelled()) {
+                        return errorResult("Diff cancelled");
+                    }
+                    try {
+                        m.invoke(inst, out1, p1, p1.getMemory(), monitor);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        Throwable c = e.getCause() != null ? e.getCause() : e;
+                        return errorResult("BinExport export of " + p1.getName() + " failed: " + c.getMessage());
+                    }
+                    if (monitor.isCancelled()) {
+                        return errorResult("Diff cancelled");
+                    }
+                    try {
+                        m.invoke(inst, out2, p2, p2.getMemory(), monitor);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        Throwable c = e.getCause() != null ? e.getCause() : e;
+                        return errorResult("BinExport export of " + p2.getName() + " failed: " + c.getMessage());
+                    }
+                } finally {
+                    jarFile.close();
+                }
+            } catch (Exception e) {
+                return errorResult("BinDiff export failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             }
-            prog1Stats.add("memory_blocks", memBlocks);
-
-            JsonObject prog2Stats = new JsonObject();
-            prog2Stats.addProperty("name", prog2);
-            prog2Stats.addProperty("note", "Comparison requires loading second program");
 
             JsonObject result = new JsonObject();
-            result.add("program1", prog1Stats);
-            result.add("program2", prog2Stats);
-            result.addProperty("status", "partial");
-            result.addProperty("message", "Single program stats returned (multi-program comparison not implemented)");
+            result.addProperty("status", "ok");
+            result.addProperty("method", "bindiff-prep");
+            result.add("program1", programDiffStats(p1));
+            result.add("program2", programDiffStats(p2));
+            result.addProperty("export1", out1.getAbsolutePath());
+            result.addProperty("export2", out2.getAbsolutePath());
+            // Function lists let the CLI compute unmatched functions (the
+            // .BinDiff DB only stores matched pairs). Capped so a
+            // pathologically large program degrades to "unmatched not
+            // computed" instead of shipping hundreds of MB over the wire.
+            result.add("functions1", functionListForDiff(p1, 100000));
+            result.add("functions2", functionListForDiff(p2, 100000));
             return result;
-        } catch (Exception e) {
-            return errorResult("Failed to diff programs: " + e.getMessage());
+        } finally {
+            // Ghidra 12: release(consumer) — the program closes when no
+            // consumers remain.
+            try { p2.release(this); } catch (Exception ignore) {}
+            try {
+                if (p1Opened) p1.release(this);
+            } catch (Exception ignore) {}
         }
     }
 
+    /// Primary function list for the CLI's unmatched-function computation;
+    /// JsonNull when the program has more than `cap` functions.
+    private JsonElement functionListForDiff(Program p, int cap) {
+        JsonArray arr = new JsonArray();
+        int n = 0;
+        for (Function f : p.getFunctionManager().getFunctions(true)) {
+            n++;
+            if (n > cap) {
+                return JsonNull.INSTANCE;
+            }
+            JsonObject o = new JsonObject();
+            o.addProperty("address", f.getEntryPoint().toString());
+            o.addProperty("name", f.getName());
+            arr.add(o);
+        }
+        return arr;
+    }
+
+    /// Runtime classloader for the plain BinExport.jar (same design as
+    /// ExportBE.java): parent = the full Ghidra classloader so all ghidra.*
+    /// classes resolve to the SAME instances Ghidra uses (no loader
+    /// constraint violations); child-first ONLY for com.google.protobuf.*,
+    /// because Ghidra's protobuf is ABI-incompatible with the 3.x code
+    /// generated into BinExport.jar.
+    static class BinExportExporterLoader extends ClassLoader {
+        final JarFile jar;
+
+        BinExportExporterLoader(ClassLoader parent, JarFile jar) {
+            super(parent);
+            this.jar = jar;
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            synchronized (getClassLoadingLock(name)) {
+                Class<?> c = findLoadedClass(name);
+                if (c == null) {
+                    if (name.startsWith("com.google.protobuf.")) {
+                        c = findClass(name);
+                    } else {
+                        c = super.loadClass(name, false);
+                    }
+                    if (resolve) {
+                        resolveClass(c);
+                    }
+                }
+                return c;
+            }
+        }
+
+        @Override
+        protected Class<?> findClass(String name) throws ClassNotFoundException {
+            byte[] b = readEntry(name);
+            if (b != null) {
+                return defineClass(name, b, 0, b.length);
+            }
+            return super.findClass(name);
+        }
+
+        private byte[] readEntry(String name) {
+            String path = name.replace('.', '/') + ".class";
+            ZipEntry e = jar.getEntry(path);
+            if (e == null) {
+                return null;
+            }
+            try (InputStream in = jar.getInputStream(e)) {
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    bo.write(buf, 0, n);
+                }
+                return bo.toByteArray();
+            } catch (Exception ex) {
+                return null;
+            }
+        }
+    }
+
+    /// Open a program from the project root folder by name (read-only).
+    /// The script itself is the non-null "consumer" owner Ghidra 12
+    /// requires; the caller closes the program when done.
+    private Program openProjectProgram(String name) {
+        DomainFolder root = getProjectRootFolder();
+        if (root == null) return null;
+        for (DomainFile f : root.getFiles()) {
+            if (name.equals(f.getName())) {
+                try {
+                    return (Program) f.getDomainObject(this, false, false, monitor);
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String availableProgramNames() {
+        DomainFolder root = getProjectRootFolder();
+        if (root == null) return "(no project)";
+        List<String> names = new ArrayList<>();
+        for (DomainFile f : root.getFiles()) {
+            Class<?> c = f.getDomainObjectClass();
+            if (c != null && Program.class.isAssignableFrom(c)) {
+                names.add(f.getName());
+            }
+        }
+        return names.isEmpty() ? "(none)" : String.join(", ", names);
+    }
+
+    private JsonObject programDiffStats(Program p) {
+        JsonObject o = new JsonObject();
+        o.addProperty("name", p.getName());
+        o.addProperty("function_count", countPrimaryFunctions(p.getFunctionManager()));
+        o.addProperty("symbol_count", p.getSymbolTable().getNumSymbols());
+        o.addProperty("memory_size", p.getMemory().getSize());
+        return o;
+    }
+
     private JsonObject handleDiffFunctions(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String func1Target = getArgString(args, "func1");
         String func2Target = getArgString(args, "func2");
@@ -4461,10 +4847,14 @@ public class GhidraCliBridge extends GhidraScript {
                 f2Info.addProperty("code", code2);
 
                 JsonObject result = new JsonObject();
+                result.addProperty("method", "positional-line-diff");
+                result.addProperty("same_program_only", true);
                 result.add("func1", f1Info);
                 result.add("func2", f2Info);
                 result.add("differences", diffLines);
                 result.addProperty("diff_count", diffLines.size());
+                result.addProperty("note",
+                    "Naive line-by-line diff of decompiled C within the loaded program (line i vs line i): no alignment, so an inserted line shifts the comparison, and no similarity scoring. Not BinDiff.");
                 return result;
             } finally {
                 decompiler.dispose();
@@ -4472,12 +4862,13 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to diff functions: " + e.getMessage());
         }
+        });
     }
 
     // --- Patch Handlers ---
 
     private JsonObject handlePatchBytes(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressStr = getArgString(args, "address");
         String hexData = getArgString(args, "hex");
@@ -4518,10 +4909,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to patch bytes: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handlePatchNop(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressStr = getArgString(args, "address");
         if (addressStr == null) return errorResult("Address required");
@@ -4584,10 +4976,11 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to NOP instruction: " + e.getMessage());
         }
+        });
     }
 
     private JsonObject handlePatchExport(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String outputPath = getArgString(args, "output");
         if (outputPath == null || outputPath.isEmpty()) {
@@ -4626,15 +5019,19 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to export binary: " + e.getMessage());
         }
+        });
     }
 
     // --- Disasm Handler ---
 
     private JsonObject handleDisasm(JsonObject args) {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         String addressStr = getArgString(args, "address");
         int count = getArgInt(args, "count", 10);
+        boolean resolve = getArgBool(args, "resolve", true);
+        String endStr = getArgString(args, "end");
+        Address endAddr = (endStr != null && !endStr.isEmpty()) ? resolveAddress(endStr) : null;
 
         if (addressStr == null || addressStr.isEmpty()) {
             return errorResult("Address required");
@@ -4668,9 +5065,11 @@ public class GhidraCliBridge extends GhidraScript {
 
             JsonArray results = new JsonArray();
             Instruction current = instruction;
+            int maxIter = endAddr != null ? 1000000 : count;
 
-            for (int i = 0; i < count && current != null; i++) {
+            for (int i = 0; i < maxIter && current != null; i++) {
                 Address instrAddr = current.getAddress();
+                if (endAddr != null && instrAddr.compareTo(endAddr) > 0) break;
                 byte[] byteArray = current.getBytes();
                 StringBuilder bytesHex = new StringBuilder();
                 for (byte b : byteArray) {
@@ -4689,24 +5088,377 @@ public class GhidraCliBridge extends GhidraScript {
                 instrData.addProperty("bytes", bytesHex.toString());
                 instrData.addProperty("mnemonic", mnemonic);
                 instrData.add("operands", operands);
+
+                if (resolve) {
+                    JsonObject loaded = resolveLiteralLoad(current, operands);
+                    if (loaded != null) instrData.add("loaded", loaded);
+                }
                 results.add(instrData);
 
                 current = current.getNext();
+                if (results.size() >= 200000) break; // hard safety cap
             }
 
             JsonObject result = new JsonObject();
-            result.add("instructions", results);
-            result.addProperty("count", results.size());
-            return result;
+            return listResponse(result, "instructions", results);
         } catch (Exception e) {
             return errorResult("Failed to disassemble: " + e.getMessage());
         }
+        });
+    }
+
+    /**
+     * If the instruction is a PC-relative literal load (ARM ldr rN, [pc, #imm] rendered
+     * by Ghidra as an operand like [0xADDR]), read the pool word and return its value
+     * plus any symbol/string resolution. Returns null when not a literal load.
+     */
+    private JsonObject resolveLiteralLoad(Instruction ins, JsonArray operands) {
+        try {
+            String mn = ins.getMnemonicString().toLowerCase();
+            if (!mn.equals("ldr") && !mn.equals("ldrb") && !mn.equals("ldrh")
+                && !mn.equals("lit") && !mn.equals("ldrsh")) {
+                return null;
+            }
+            if (operands.size() < 2) return null;
+            String op1 = operands.get(1).getAsString();
+            // literal form: [0x...]
+            if (!op1.startsWith("[") || !op1.contains("0x")) return null;
+            int sx = op1.indexOf("0x");
+            int ex = op1.indexOf(']', sx);
+            if (ex < 0) return null;
+            String hex = op1.substring(sx + 2, ex).trim();
+            if (hex.isEmpty()) return null;
+            long poolAddr = Long.parseUnsignedLong(hex, 16);
+            Address pool = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(poolAddr);
+            Memory memory = currentProgram.getMemory();
+            if (!memory.contains(pool)) return null;
+            int wordSize = currentProgram.getAddressFactory().getDefaultAddressSpace().getPointerSize();
+            byte[] buf = new byte[wordSize];
+            memory.getBytes(pool, buf);
+            long value = 0;
+            for (int i = 0; i < wordSize; i++) value |= ((long)(buf[i] & 0xFF)) << (8 * i);
+
+            JsonObject loaded = new JsonObject();
+            loaded.addProperty("pool", pool.toString());
+            loaded.addProperty("value", String.format("0x%08x", value & 0xFFFFFFFFL));
+            Symbol sym = currentProgram.getSymbolTable().getPrimarySymbol(pool);
+            if (sym != null) loaded.addProperty("pool_symbol", sym.getName());
+
+            // If the loaded value points at a string or symbol, annotate it.
+            Address target = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(value);
+            if (memory.contains(target)) {
+                Symbol tsym = currentProgram.getSymbolTable().getPrimarySymbol(target);
+                if (tsym != null) loaded.addProperty("target_symbol", tsym.getName());
+                try {
+                    int read = 80;
+                    byte[] sb = new byte[read];
+                    int n = memory.getBytes(target, sb);
+                    StringBuilder str = new StringBuilder();
+                    for (int i = 0; i < n; i++) {
+                        char c = (char)(sb[i] & 0xFF);
+                        if (c == 0) break;
+                        if (c < 32 || c > 126) break;
+                        str.append(c);
+                    }
+                    if (str.length() >= 4) loaded.addProperty("target_string", str.toString());
+                } catch (Exception ignored) {}
+            }
+            return loaded;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // --- Find Constant Handler ---
+
+    /**
+     * Find a little-endian constant (2/4/8 bytes) anywhere in loaded memory and, for
+     * each hit, locate the PC-relative LDR instructions that reference that memory
+     * location (ARM literal pool archaeology). Args:
+     *   value (hex string, required), size (2|4|8, default 4), max (default 100), refs (bool, default true)
+     */
+    private JsonObject handleFindConstant(JsonObject args) {
+        return requireProgram(() -> {
+        String valueStr = getArgString(args, "value");
+        if (valueStr == null || valueStr.isEmpty()) return errorResult("value required");
+        int size = getArgInt(args, "size", 4);
+        int max = getArgInt(args, "max", 100);
+        boolean refs = getArgBool(args, "refs", true);
+        if (size != 2 && size != 4 && size != 8) return errorResult("size must be 2, 4 or 8");
+
+        try {
+            String v = valueStr.replace("0x", "").replace("0X", "").trim();
+            long value = Long.parseUnsignedLong(v, 16);
+            long maxVal = (size == 8) ? 0xFFFFFFFFFFFFFFFFL : (1L << (8 * size)) - 1;
+            if (value > maxVal) {
+                return errorResult("Value 0x" + v + " does not fit in " + size + " bytes");
+            }
+
+            byte[] pat = new byte[size];
+            for (int i = 0; i < size; i++) pat[i] = (byte)((value >> (8 * i)) & 0xFF);
+
+            Memory memory = currentProgram.getMemory();
+            JsonArray hits = new JsonArray();
+            Address from = memory.getMinAddress();
+            while (from != null && hits.size() < max) {
+                Address found = memory.findBytes(from, pat, null, true, monitor);
+                if (found == null) break;
+                ghidra.program.model.mem.MemoryBlock blk = memory.getBlock(found);
+                // readback test: NOBITS/bss blocks read back as all-zero, so a
+                // non-zero pattern can never actually match there
+                boolean zeroBlock = true;
+                if (blk != null && blk.getSize() > 0) {
+                    byte[] rb = new byte[size];
+                    memory.getBytes(found, rb);
+                    for (byte b : rb) if (b != 0) { zeroBlock = false; break; }
+                }
+                JsonObject hit = new JsonObject();
+                hit.addProperty("address", found.toString());
+                if (blk != null) hit.addProperty("block", blk.getName());
+                hit.addProperty("zero_block", zeroBlock);
+                if (refs && !zeroBlock) {
+                    JsonArray refList = new JsonArray();
+                    Address start = found.add(-0x804);
+                    if (start != null) {
+                        for (Instruction cand : currentProgram.getListing().getInstructions(currentProgram.getAddressFactory().getAddressSet(start, found), true)) {
+                            Address poolAddr = literalPoolTarget(cand);
+                            if (poolAddr != null && poolAddr.equals(found)) {
+                                JsonObject r = new JsonObject();
+                                r.addProperty("address", cand.getAddress().toString());
+                                r.addProperty("disasm", cand.toString());
+                                Function fn = currentProgram.getFunctionManager().getFunctionContaining(cand.getAddress());
+                                if (fn != null) r.addProperty("function", fn.getName());
+                                refList.add(r);
+                            }
+                        }
+                    }
+                    hit.add("ldr_refs", refList);
+                }
+                hits.add(hit);
+                from = found.add(1);
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("value", "0x" + Long.toHexString(value));
+            result.addProperty("size", size);
+            return listResponse(result, "hits", hits);
+        } catch (Exception e) {
+            return errorResult("find_constant failed: " + e.getMessage());
+        }
+        });
+    }
+
+    /** For ARM literal loads, return the pool address the instruction reads from, else null. */
+    private Address literalPoolTarget(Instruction ins) {
+        try {
+            String mn = ins.getMnemonicString().toLowerCase();
+            if (!(mn.equals("ldr") || mn.equals("lit") || mn.equals("ldrb") || mn.equals("ldrh"))) return null;
+            for (int i = 0; i < ins.getNumOperands(); i++) {
+                String op = ins.getDefaultOperandRepresentation(i);
+                if (op.startsWith("[") && op.contains("0x")) {
+                    int sx = op.indexOf("0x");
+                    int ex = op.indexOf(']', sx);
+                    if (ex < 0) ex = op.length();
+                    String hex = op.substring(sx + 2, ex).trim();
+                    if (hex.isEmpty()) return null;
+                    return currentProgram.getAddressFactory().getDefaultAddressSpace()
+                        .getAddress(Long.parseUnsignedLong(hex, 16));
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Find instructions whose disassembly text matches a pattern. Args:
+     *  pattern (required, case-insensitive substring by default), limit
+     *  (default 100), start/end (optional range). Matches instruction text
+     *  directly, so it works even where Ghidra failed to create references
+     *  (e.g. under-analyzed programs: find "bl srand" callers without xrefs). */
+    private JsonObject handleFindInstruction(JsonObject args) {
+        return requireProgram(() -> {
+        String pattern = getArgString(args, "pattern");
+        if (pattern == null || pattern.isEmpty()) return errorResult("pattern required");
+        int limit = getArgInt(args, "limit", 100);
+        boolean ci = getArgBool(args, "case_insensitive", true);
+        String s = getArgString(args, "start");
+        String e = getArgString(args, "end");
+        Address start = (s != null && !s.isEmpty()) ? resolveAddress(s) : null;
+        Address end = (e != null && !e.isEmpty()) ? resolveAddress(e) : null;
+        if ((s != null && !s.isEmpty() && start == null) ||
+            (e != null && !e.isEmpty() && end == null)) return errorResult("Invalid address");
+
+        try {
+            // Two-sided ranges use a tight AddressSet; one-sided/none iterate
+            // the full instruction set and filter by comparison.
+            AddressSetView view = (start != null && end != null)
+                ? currentProgram.getAddressFactory().getAddressSet(start, end)
+                : currentProgram.getMemory();
+            String pat = ci ? pattern.toLowerCase() : pattern;
+
+            JsonArray matches = new JsonArray();
+            int scanned = 0;
+            boolean truncated = false;
+            for (Instruction ins : currentProgram.getListing().getInstructions(view, true)) {
+                Address a = ins.getAddress();
+                if (start != null && a.compareTo(start) < 0) continue;
+                if (end != null && a.compareTo(end) > 0) continue;
+                scanned++;
+                String text = ins.toString();
+                boolean hit = ci ? text.toLowerCase().contains(pat) : text.contains(pat);
+                if (hit) {
+                    JsonObject m = new JsonObject();
+                    m.addProperty("address", a.toString());
+                    m.addProperty("disasm", text);
+                    Function fn = currentProgram.getFunctionManager().getFunctionContaining(a);
+                    if (fn != null) m.addProperty("function", fn.getName());
+                    matches.add(m);
+                    if (matches.size() >= limit) break;
+                }
+                if (scanned > 5000000) { truncated = true; break; } // safety cap
+            }
+
+            JsonObject result = new JsonObject();
+            result.addProperty("pattern", pattern);
+            result.addProperty("scanned", scanned);
+            result.add("matches", matches);
+            result.addProperty("count", matches.size());
+            result.addProperty("truncated", truncated);
+            return result;
+        } catch (Exception ex) {
+            return errorResult("find_instruction failed: " + ex.getMessage());
+        }
+        });
+    }
+
+    /** List functions whose entry point lies in [start, end]. Args: start, end. */
+    private JsonObject handleFunctionsRange(JsonObject args) {
+        return requireProgram(() -> {
+        String s = getArgString(args, "start");
+        String e = getArgString(args, "end");
+        if (s == null || e == null || s.isEmpty() || e.isEmpty()) return errorResult("start and end required");
+        Address start = resolveAddress(s);
+        Address end = resolveAddress(e);
+        if (start == null || end == null) return errorResult("Invalid range");
+
+        AddressSet set = currentProgram.getAddressFactory().getAddressSet(start, end);
+        JsonArray funcs = new JsonArray();
+        for (Function fn : currentProgram.getFunctionManager().getFunctions(set, true)) {
+            JsonObject f = new JsonObject();
+            f.addProperty("name", fn.getName());
+            f.addProperty("entry", fn.getEntryPoint().toString());
+            f.addProperty("size", (int) (fn.getBody().getMaxAddress()
+                .subtract(fn.getBody().getMinAddress()) + 1));
+            funcs.add(f);
+        }
+        JsonObject result = new JsonObject();
+        return listResponse(result, "functions", funcs);
+        });
+    }
+
+    /** List defined data items in [start, end]. Args: start, end, limit (default 200). */
+    private JsonObject handleDefinedData(JsonObject args) {
+        return requireProgram(() -> {
+        String s = getArgString(args, "start");
+        String e = getArgString(args, "end");
+        if (s == null || e == null || s.isEmpty() || e.isEmpty()) return errorResult("start and end required");
+        Address start = resolveAddress(s);
+        Address end = resolveAddress(e);
+        if (start == null || end == null) return errorResult("Invalid range");
+        int limit = getArgInt(args, "limit", 200);
+
+        AddressSet set = currentProgram.getAddressFactory().getAddressSet(start, end);
+        JsonArray items = new JsonArray();
+        for (Data di : currentProgram.getListing().getData(set, true)) {
+            if (!di.isDefined()) continue;
+            Address da = di.getAddress();
+            JsonObject d = new JsonObject();
+            d.addProperty("address", da.toString());
+            d.addProperty("type", di.getDataType().getCategoryPath().getPath());
+            d.addProperty("size", di.getLength());
+            Symbol sym = currentProgram.getSymbolTable().getPrimarySymbol(da);
+            if (sym != null) d.addProperty("name", sym.getName());
+            try {
+                int n = Math.min(di.getLength(), 16);
+                byte[] buf = new byte[n];
+                currentProgram.getMemory().getBytes(da, buf);
+                StringBuilder hex = new StringBuilder();
+                for (byte b : buf) hex.append(String.format("%02x", b & 0xff));
+                d.addProperty("bytes", hex.toString());
+            } catch (Exception ignore) { /* unreadable block; skip bytes */ }
+            items.add(d);
+            if (items.size() >= limit) break;
+        }
+        JsonObject result = new JsonObject();
+        return listResponse(result, "items", items);
+        });
+    }
+
+    // --- Decompile Multi Handler ---
+
+    /** Decompile several addresses in one round trip. Args: addresses [..], timeout_secs. */
+    private JsonObject handleDecompileMulti(JsonObject args) {
+        return requireProgram(() -> {
+        if (args == null || !args.has("addresses")) return errorResult("addresses array required");
+        JsonArray addrs = args.getAsJsonArray("addresses");
+        int timeoutSecs = getArgInt(args, "timeout_secs", 0);
+
+        DecompInterface decompiler = new DecompInterface();
+        decompiler.openProgram(currentProgram);
+        JsonArray results = new JsonArray();
+        try {
+            for (int i = 0; i < addrs.size(); i++) {
+                String a = addrs.get(i).getAsString();
+                JsonObject item = new JsonObject();
+                item.addProperty("address", a);
+                try {
+                    Address addr = resolveAddress(a);
+                    if (addr == null) { item.addProperty("error", "bad address"); results.add(item); continue; }
+                    Function func = currentProgram.getFunctionManager().getFunctionContaining(addr);
+                    if (func == null) { item.addProperty("error", "no function"); results.add(item); continue; }
+                    DecompileResults results2 = decompiler.decompileFunction(func, timeoutSecs, monitor);
+                    if (results2.decompileCompleted()) {
+                        item.addProperty("name", func.getName());
+                        item.addProperty("entry", func.getEntryPoint().toString());
+                        item.addProperty("code", results2.getDecompiledFunction().getC());
+                    } else {
+                        item.addProperty("error", "decompile failed");
+                    }
+                } catch (Exception e) {
+                    item.addProperty("error", e.getMessage());
+                }
+                results.add(item);
+            }
+        } finally {
+            decompiler.dispose();
+        }
+        JsonObject result = new JsonObject();
+        result.add("results", results);
+        return result;
+        });
     }
 
     // --- Stats Handler ---
 
+    /**
+     * Count PRIMARY functions only — the same set `function list` iterates
+     * (fm.getFunctions(true)). fm.getFunctionCount() also counts non-primary
+     * duplicates (functions that exist in multiple function spaces), which is
+     * why stats and function list used to disagree.
+     */
+    private int countPrimaryFunctions(FunctionManager fm) {
+        int count = 0;
+        FunctionIterator it = fm.getFunctions(true);
+        while (it.hasNext()) {
+            it.next();
+            count++;
+        }
+        return count;
+    }
+
     private JsonObject handleStats() {
-        if (currentProgram == null) return errorResult("No program loaded");
+        return requireProgram(() -> {
 
         try {
             FunctionManager fm = currentProgram.getFunctionManager();
@@ -4715,7 +5467,7 @@ public class GhidraCliBridge extends GhidraScript {
             DataTypeManager dtm = currentProgram.getDataTypeManager();
             Listing listing = currentProgram.getListing();
 
-            int functionCount = fm.getFunctionCount();
+            int functionCount = countPrimaryFunctions(fm);
 
             int symbolCount = 0;
             SymbolIterator symIter = symbolTable.getAllSymbols(true);
@@ -4769,6 +5521,7 @@ public class GhidraCliBridge extends GhidraScript {
         } catch (Exception e) {
             return errorResult("Failed to gather statistics: " + e.getMessage());
         }
+        });
     }
 
     // --- Script Handlers ---
@@ -5023,9 +5776,7 @@ public class GhidraCliBridge extends GhidraScript {
             }
 
             JsonObject result = new JsonObject();
-            result.add("scripts", scripts);
-            result.addProperty("count", scripts.size());
-            return result;
+            return listResponse(result, "scripts", scripts);
         } catch (Exception e) {
             return errorResult("Failed to list scripts: " + e.getMessage());
         }
