@@ -17,18 +17,18 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 
 # BinDiff database (.BinDiff is SQLite)
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Parsing
-pest = "2.7"
-pest_derive = "2.7"
+pest = "2.9"
+pest_derive = "2.9"
 
 # Output formatting
-comfy-table = "7.1"
+comfy-table = "8.0"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Logging
 env_logger = "0.11"
@@ -45,29 +45,29 @@ tokio = { version = "1.35", features = ["rt", "io-util", "time", "net"] }
 md5 = "0.7"
 
 # File system & paths
-dirs = "5.0"
+dirs = "7.0"
 tempfile = "3.8"
 walkdir = "2.4"
 
 # Process management
-which = "6.0"
+which = "8.0"
 libc = "0.2"
 
 # Regex
 regex = "1.10"
 
 # Setup command dependencies
-reqwest = { version = "0.11", features = ["json", "stream", "rustls-tls"] }
-zip = "0.6"
+reqwest = { version = "0.13", features = ["json", "stream", "rustls"] }
+zip = "8.6"
 futures-util = "0.3"
-indicatif = "0.17"
+indicatif = "0.18"
 
 
 [dev-dependencies]
 assert_cmd = "2.0"
-predicates = "3.0"
+predicates = "3.1"
 tempfile = "3.8"
-serial_test = "3.0"
+serial_test = "4.0"
 uuid = { version = "1.6", features = ["v4"] }
 # Snapshot testing - captures full output and detects regressions
 insta = { version = "1.40", features = ["json", "redactions"] }

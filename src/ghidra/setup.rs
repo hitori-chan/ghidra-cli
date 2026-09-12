@@ -151,9 +151,10 @@ pub fn extract_zip(zip_path: &Path, target_dir: &Path) -> Result<PathBuf> {
 
         // Capture the root directory (first path component)
         if root_dir.is_none() {
-            if let Some(first_component) = file.enclosed_name().and_then(|p| p.components().next())
-            {
-                root_dir = Some(target_dir.join(first_component.as_os_str()));
+            if let Some(first_component) = file.enclosed_name().and_then(|p| {
+                p.components().next().map(|c| c.as_os_str().to_os_string())
+            }) {
+                root_dir = Some(target_dir.join(first_component));
             }
         }
 

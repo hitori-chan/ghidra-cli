@@ -297,7 +297,7 @@ fn format_table<T: Serialize>(data: &[T]) -> Result<String> {
     }
 
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
+    table.load_style(UTF8_FULL);
 
     // Add header
     table.set_header(&keys);
